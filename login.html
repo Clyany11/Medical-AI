@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>登录 · AI健康医生</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #0f9b8e 0%, #22c1a4 100%);
+            padding: 20px;
+        }
+        .auth-card {
+            width: 100%;
+            max-width: 400px;
+            background: #fff;
+            border-radius: 18px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.18);
+            padding: 36px 32px 32px;
+        }
+        .auth-card h1 {
+            font-size: 22px;
+            color: #0f9b8e;
+            text-align: center;
+            margin-bottom: 6px;
+        }
+        .auth-card .sub {
+            text-align: center;
+            color: #8a9a97;
+            font-size: 13px;
+            margin-bottom: 24px;
+        }
+        .tabs {
+            display: flex;
+            background: #f1f6f5;
+            border-radius: 10px;
+            padding: 4px;
+            margin-bottom: 22px;
+        }
+        .tabs button {
+            flex: 1;
+            border: none;
+            background: transparent;
+            padding: 10px 0;
+            font-size: 15px;
+            color: #6b7a78;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all .2s;
+        }
+        .tabs button.active {
+            background: #fff;
+            color: #0f9b8e;
+            font-weight: 600;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        }
+        .field { margin-bottom: 16px; }
+        .field label {
+            display: block;
+            font-size: 13px;
+            color: #5a6b68;
+            margin-bottom: 6px;
+        }
+        .field input {
+            width: 100%;
+            padding: 12px 14px;
+            border: 1px solid #d8e3e1;
+            border-radius: 10px;
+            font-size: 15px;
+            outline: none;
+            transition: border-color .2s;
+        }
+        .field input:focus { border-color: #0f9b8e; }
+        .submit-btn {
+            width: 100%;
+            padding: 13px 0;
+            border: none;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #0f9b8e, #22c1a4);
+            color: #fff;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 6px;
+            transition: opacity .2s;
+        }
+        .submit-btn:disabled { opacity: .6; cursor: not-allowed; }
+        .msg {
+            min-height: 20px;
+            font-size: 13px;
+            margin-top: 14px;
+            text-align: center;
+        }
+        .msg.error { color: #e05a4f; }
+        .msg.ok { color: #0f9b8e; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="auth-card">
+        <h1>🏥 AI健康医生</h1>
+        <p class="sub">登录后即可保存你的咨询记录与健康记忆</p>
+
+        <div class="tabs">
+            <button id="tab-login" class="active" type="button">登录</button>
+            <button id="tab-register" type="button">注册</button>
+        </div>
+
+        <form id="auth-form">
+            <div class="field">
+                <label>用户名</label>
+                <input id="username" type="text" autocomplete="username" placeholder="3-20 位字符" required>
+            </div>
+            <div class="field">
+                <label>密码</label>
+                <input id="password" type="password" autocomplete="current-password" placeholder="至少 6 位" required>
+            </div>
+            <div class="field hidden" id="nickname-field">
+                <label>昵称（可选，默认同用户名）</label>
+                <input id="nickname" type="text" placeholder="昵称" maxlength="20">
+            </div>
+            <button class="submit-btn" id="submit-btn" type="submit">登录</button>
+        </form>
+        <div class="msg" id="msg"></div>
+    </div>
+
+    <script>
+        const form = document.getElementById('auth-form');
+        const tabLogin = document.getElementById('tab-login');
+        const tabRegister = document.getElementById('tab-register');
+        const nicknameField = document.getElementById('nickname-field');
+        const submitBtn = document.getElementById('submit-btn');
+        const msgEl = document.getElementById('msg');
+        let mode = 'login'; // 'login' | 'register'
+
+        function setMode(next) {
+            mode = next;
+            const isLogin = mode === 'login';
+            tabLogin.classList.toggle('active', isLogin);
+            tabRegister.classList.toggle('active', !isLogin);
+            nicknameField.classList.toggle('hidden', isLogin);
+            submitBtn.textContent = isLogin ? '登录' : '注册';
+            document.getElementById('password').setAttribute(
+                'autocomplete', isLogin ? 'current-password' : 'new-password'
+            );
+            msgEl.textContent = '';
+            msgEl.className = 'msg';
+        }
+
+        tabLogin.addEventListener('click', () => setMode('login'));
+        tabRegister.addEventListener('click', () => setMode('register'));
+
+        function showMsg(text, type) {
+            msgEl.textContent = text;
+            msgEl.className = 'msg ' + (type || '');
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value;
+            const nickname = document.getElementById('nickname').value.trim();
+
+            if (mode === 'register' && username.length < 3) {
+                showMsg('用户名至少 3 个字符', 'error');
+                return;
+            }
+            if (password.length < 6) {
+                showMsg('密码至少 6 位', 'error');
+                return;
+            }
+
+            const url = mode === 'login' ? '/auth/login' : '/auth/register';
+            const body = mode === 'login'
+                ? { username, password }
+                : { username, password, nickname: nickname || null };
+
+            submitBtn.disabled = true;
+            submitBtn.textContent = mode === 'login' ? '登录中...' : '注册中...';
+            try {
+                const resp = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                    body: JSON.stringify(body)
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    throw new Error(data.detail || '请求失败');
+                }
+                // 保存登录态 (存 sessionStorage: 关闭浏览器后失效, 需重新登录)
+                sessionStorage.setItem('token', data.access_token);
+                sessionStorage.setItem('username', data.user.username);
+                sessionStorage.setItem('nickname', data.user.nickname || data.user.username);
+                showMsg('成功，正在进入...', 'ok');
+                location.href = '/chat.html';
+            } catch (err) {
+                showMsg(err.message || '网络错误', 'error');
+                submitBtn.disabled = false;
+                submitBtn.textContent = mode === 'login' ? '登录' : '注册';
+            }
+        });
+
+        // 若本次会话已登录, 直接进入聊天页
+        if (sessionStorage.getItem('token')) {
+            location.href = '/chat.html';
+        }
+    </script>
+</body>
+</html>

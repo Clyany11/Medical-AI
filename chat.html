@@ -1,0 +1,2271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI健康医生 - 在线问诊</title>
+    <!-- 引入 marked.js -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- 新增：引入 PDF.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        // 配置 PDF.js worker
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+    <!-- 引入 marked.js 用于解析 Markdown -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+     <!-- 【新增】引入 RecordRTC 和 Lamejs 用于 MP3 录音 -->
+    <script src="https://cdn.jsdelivr.net/npm/recordrtc@5.6.2/RecordRTC.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Microsoft YaHei', sans-serif;
+        }
+
+        body {
+            background-color: #f5f7fa;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        /* 左侧会话栏 + 右侧聊天区 的两列布局 */
+        .app-layout {
+            display: flex;
+            gap: 16px;
+            height: calc(100vh - 40px);
+        }
+
+        .session-sidebar {
+            width: 260px;
+            flex-shrink: 0;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .new-session-btn {
+            margin: 16px;
+            padding: 12px;
+            border: none;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #42b883, #359469);
+            color: white;
+            font-size: 15px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        .new-session-btn:hover {
+            opacity: 0.9;
+        }
+
+        .session-list-title {
+            font-size: 12px;
+            color: #95a5a6;
+            padding: 4px 16px 8px;
+        }
+
+        .session-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0 8px 8px;
+        }
+
+        .session-item {
+            padding: 10px 12px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 14px;
+            color: #2c3e50;
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            transition: background 0.2s;
+        }
+
+        .session-item:hover {
+            background: #f0f4f8;
+        }
+
+        .session-item.active {
+            background: #e8f5f0;
+            color: #359469;
+            font-weight: 600;
+        }
+
+        .session-empty {
+            padding: 12px;
+            font-size: 13px;
+            color: #95a5a6;
+        }
+
+        .chat-container {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+            flex: 1;
+            min-width: 0;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .chat-header {
+            background: linear-gradient(135deg, #42b883, #359469);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .chat-header h1 {
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+
+        .chat-header p {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+
+        .chat-messages {
+            flex: 1;
+            padding: 24px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .message {
+            max-width: 85%;
+            padding: 12px 16px;
+            border-radius: 18px;
+            line-height: 1.6;
+            font-size: 15px;
+            word-wrap: break-word;
+            position: relative; /* 用于定位 */
+        }
+
+        .ai-message {
+            background-color: #e8f5f0;
+            color: #2c3e50;
+            align-self: flex-start;
+            border-bottom-left-radius: 6px;
+            overflow: visible !important;
+        }
+
+        /* Markdown 内容样式优化 */
+        .ai-message p {
+            margin-bottom: 8px;
+        }
+        .ai-message p:last-child {
+            margin-bottom: 0;
+        }
+        .ai-message ul, .ai-message ol {
+            padding-left: 20px;
+            margin-bottom: 8px;
+        }
+        .ai-message li {
+            margin-bottom: 4px;
+        }
+        .ai-message strong {
+            color: #2c3e50;
+            font-weight: bold;
+        }
+        .ai-message code {
+            background-color: rgba(0,0,0,0.05);
+            padding: 2px 4px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.9em;
+        }
+        .ai-message pre {
+            background-color: #2d2d2d;
+            color: #fff;
+            padding: 10px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 8px 0;
+        }
+        .ai-message pre code {
+            background-color: transparent;
+            padding: 0;
+            color: inherit;
+        }
+
+        /* 新增：AI消息内图片样式 */
+        .ai-message img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+            margin: 8px 0;
+            display: block;
+            background: transparent;
+        }
+
+        .ai-message img::after {
+            content: "图片加载失败";
+            color: #999;
+            font-size: 14px;
+            display: block;
+            padding: 8px;
+            border: 1px dashed #ddd;
+            border-radius: 8px;
+        }
+
+        .user-message {
+            background-color: #42b883;
+            color: white;
+            align-self: flex-end;
+            border-bottom-right-radius: 6px;
+        }
+
+        .input-area {
+            padding: 16px;
+            border-top: 1px solid #eee;
+            display: flex;
+            gap: 12px;
+        }
+
+        /* 修改 #user-input 样式 */
+        #user-input {
+            flex: 1;
+            padding: 14px 18px;
+            border: 2px solid #e0e6ed;
+            border-radius: 24px;
+            font-size: 15px;
+            outline: none;
+            transition: border-color 0.3s;
+            
+            /* 新增样式 */
+            resize: none; /* 禁止用户手动拖拽改变大小 */
+            overflow-y: auto; /* 内容过多时允许滚动（作为保底） */
+            max-height: 120px; /* 限制最大高度 */
+            line-height: 1.5;
+            font-family: inherit; 
+            white-space: pre-wrap; 
+            word-wrap: break-word;
+
+            /* --- 新增：隐藏滚动条 --- */
+            /* Chrome, Safari, Edge, Opera */
+            scrollbar-width: none; /* Firefox */
+            -ms-overflow-style: none;  /* IE and Edge */
+        }
+
+        /* Chrome, Safari, Edge, Opera 的具体隐藏写法 */
+        #user-input::-webkit-scrollbar {
+            display: none;
+        }
+
+        #user-input:focus {
+            border-color: #42b883;
+        }
+
+        /* 移除 placeholder 的多余边距 */
+        #user-input::placeholder {
+            color: #999;
+        }
+
+        #send-btn {
+            background: #42b883;
+            color: white;
+            border: none;
+            padding: 14px 24px;
+            border-radius: 24px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background 0.3s;
+        }
+
+        #send-btn:hover { background: #359469; }
+        #send-btn:disabled { background: #ccc; cursor: not-allowed; }
+
+        /* 优化后的加载动画样式 */
+        .typing-indicator {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 4px 0;
+        }
+        
+        .typing-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #42b883;
+            animation: bounce 1.4s infinite ease-in-out both;
+        }
+        
+        .typing-dot:nth-child(1) { animation-delay: -0.32s; }
+        .typing-dot:nth-child(2) { animation-delay: -0.16s; }
+        
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1); }
+        }
+
+        .thinking-text {
+            font-size: 13px;
+            color: #666;
+            margin-left: 8px;
+            font-style: italic;
+        }
+
+        /* 新增：反馈区域样式 */
+        .feedback-area {
+            display: flex;
+            gap: 10px;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(0,0,0,0.05);
+            justify-content: flex-end; /* 靠右对齐，或者 flex-start 靠左 */
+        }
+
+        .feedback-btn {
+            background: none;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            cursor: pointer;
+            padding: 4px 8px;
+            font-size: 16px;
+            transition: all 0.2s;
+            color: #666;
+        }
+
+        .feedback-btn:hover {
+            background-color: #f0f0f0;
+            color: #333;
+            transform: scale(1.1);
+        }
+
+        .feedback-btn.active {
+            background-color: #e8f5f0;
+            border-color: #42b883;
+            color: #42b883;
+        }
+        
+        .feedback-btn.disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* 新增：右侧预览栏相关样式 */
+        .preview-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 998;
+            display: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .preview-overlay.active {
+            display: block;
+            opacity: 1;
+        }
+
+        .preview-sidebar {
+            position: fixed;
+            top: 0;
+            right: -100%; /* 默认隐藏在右侧屏幕外 */
+            width: 60%; /* 桌面端宽度 */
+            max-width: 800px;
+            height: 100%;
+            background: white;
+            box-shadow: -4px 0 15px rgba(0,0,0,0.1);
+            z-index: 999;
+            transition: right 0.3s ease-in-out;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .preview-sidebar.active {
+            right: 0;
+        }
+
+        .preview-header {
+            padding: 15px 20px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #f9f9f9;
+        }
+
+        .preview-title {
+            font-weight: bold;
+            color: #333;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 80%;
+        }
+
+        .close-preview-btn {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: #666;
+            padding: 0 5px;
+        }
+
+         /* 修改 .preview-content 样式 */
+        .preview-content {
+            flex: 1;
+            width: 100%;
+            height: 100%;
+            border: none;
+            background: #525659; /* PDF阅读器常用的深灰色背景，提升体验 */
+            overflow: auto; /* 允许内部滚动 */
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            padding: 20px 0;
+        }
+        /* 新增：PDF.js 渲染容器样式 */
+        #pdf-render-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+            width: 100%; /* 确保容器宽度为100% */
+            height: 100%; /* 确保容器高度为100% */
+        }
+        
+        .pdf-page-canvas {
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            max-width: 95%;
+            height: auto;
+        }
+
+        .pdf-loading-text {
+            color: white;
+            margin-top: 50px;
+        }
+
+        .preview-placeholder {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100%;
+            color: #666;
+            flex-direction: column;
+        }
+
+        /* 移动端适配 */
+        @media (max-width: 768px) {
+            .preview-sidebar {
+                width: 100%;
+                max-width: none;
+            }
+        }
+
+        /* 文档链接按钮样式 */
+        .doc-link-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background-color: #e3f2fd;
+            color: #1976d2;
+            padding: 6px 12px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-size: 14px;
+            margin: 4px 0;
+            border: 1px solid #bbdefb;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .doc-link-btn:hover {
+            background-color: #bbdefb;
+        }
+
+        .doc-icon {
+            font-weight: bold;
+        }
+
+        /* 新增：语音按钮样式 */
+        #voice-btn {
+            background: #f0f2f5;
+            border: none;
+            width: 46px;
+            height: 46px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            color: #666;
+            flex-shrink: 0; /* 防止被压缩 */
+        }
+
+        #voice-btn:hover {
+            background: #e0e0e0;
+            color: #333;
+        }
+
+        /* 录音中的状态 */
+        #voice-btn.recording {
+            background: #ff4d4f;
+            color: white;
+            animation: pulse-red 1.5s infinite;
+        }
+
+        @keyframes pulse-red {
+            0% { box-shadow: 0 0 0 0 rgba(255, 77, 79, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(255, 77, 79, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 77, 79, 0); }
+        }
+
+        /* 禁用状态 */
+        #voice-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* 新增：模式切换按钮 */
+        #mode-toggle-btn {
+            background: transparent;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0 10px;
+            color: #666;
+            transition: transform 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #mode-toggle-btn:hover {
+            color: #42b883;
+            transform: scale(1.1);
+        }
+
+        /* 新增：按住说话大按钮 */
+        #voice-hold-btn {
+            width: 100%;
+            height: 46px; /* 与输入框高度一致 */
+            background-color: #f0f2f5;
+            border: 2px solid #e0e6ed;
+            border-radius: 24px;
+            font-size: 16px;
+            color: #666;
+            cursor: pointer;
+            transition: all 0.2s;
+            user-select: none; /* 防止长按选中文字 */
+            -webkit-user-select: none;
+        }
+
+        #voice-hold-btn:hover {
+            background-color: #e0e0e0;
+        }
+
+        /* 录音中的状态 */
+        #voice-hold-btn.recording {
+            background-color: #ff4d4f;
+            border-color: #ff4d4f;
+            color: white;
+            animation: pulse-red 1.5s infinite;
+        }
+        
+        /* 录音中稍微缩小一点，模拟按压感 */
+        #voice-hold-btn.recording:active {
+            transform: scale(0.98);
+        }
+
+        /* 确保 textarea 在 flex 容器中正确表现 */
+        #text-input-view {
+            align-items: center;
+        }
+
+         /* --- 修改：适配绿色Header的模式切换按钮样式 --- */
+        .mode-switch-container {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin-top: 10px; /* 与上方标题保持距离 */
+            width: 100%;
+        }
+
+        .mode-btn {
+            padding: 6px 14px;
+            border: 1px solid rgba(255, 255, 255, 0.6); /* 白色半透明边框 */
+            border-radius: 20px;
+            background-color: rgba(255, 255, 255, 0.15); /* 白色半透明背景 */
+            color: white; /* 文字白色 */
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+            flex-shrink: 0;
+            min-width: 80px;
+            text-align: center;
+            backdrop-filter: blur(4px); /* 毛玻璃效果，提升质感 */
+        }
+
+        .mode-btn:hover {
+            background-color: rgba(255, 255, 255, 0.25);
+            transform: translateY(-1px);
+        }
+
+        /* 选中状态：纯白背景，绿色文字，突出显示 */
+        .mode-btn.active {
+            background-color: white;
+            border-color: white;
+            color: #359469; /* 使用Header中的深绿色 */
+            font-weight: bold;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        /* 1:1完美复刻：外圆圈 + 内部等间距 [点 · 弧线) 弧线)] */
+        .voice-wave-icon {
+            width: 32px;
+            height: 32px;
+            border: 2px solid #222222; /* 外圆圈 */
+            border-radius: 50%;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-sizing: border-box;
+            overflow: hidden;
+
+            /* ✅ iOS 抗锯齿 & 细线修复 */
+            transform: translateZ(0);
+            -webkit-transform: translateZ(0);
+            -webkit-backface-visibility: hidden;
+            backface-visibility: hidden;
+        }
+
+        /* 通用定位：所有内部元素绝对居中，并整体向左偏移 */
+        .voice-wave-icon .dot,
+        .voice-wave-icon span {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+
+            /* ✅ 强制 GPU 合成，避免 iOS 细线 */
+            transform: translate(-50%, -50%) translateX(-5px) translateZ(0);
+            -webkit-transform: translate(-50%, -50%) translateX(-5px) translateZ(0);
+
+            -webkit-backface-visibility: hidden;
+            backface-visibility: hidden;
+            will-change: transform;
+
+            /* ✅ 防止亚像素边缘渲染出细线 */
+            outline: 1px solid transparent;
+        }
+
+        /* 1. 左侧小圆点 */
+        .voice-wave-icon .dot {
+            width: 4px;
+            height: 4px;
+            background-color: #222222;
+            border-radius: 50%;
+            z-index: 2;
+        }
+
+        /* 2. 右侧声波弧线通用样式 - iOS 终极兼容版 */
+        .voice-wave-icon span {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+
+            transform: translate(-50%, -50%) translateX(-3px) translateZ(0);
+            -webkit-transform: translate(-50%, -50%) translateX(-3px) translateZ(0);
+
+            /* 保持原有 border 绘制方式 */
+            border: 2px solid #222222;
+            border-radius: 50%;
+            box-sizing: border-box;
+
+            /* 关键修复 1: 移除左侧边框 */
+            border-left: 0;
+            border-top: transparent;
+            border-bottom: transparent;
+
+            /* 关键修复 2: 裁切 */
+            clip-path: inset(10% 0 10% 40%);
+
+            /* 关键修复 3: 隐藏溢出 */
+            overflow: hidden;
+
+            background: transparent;
+
+            /* ✅ iOS 渲染修复 */
+            -webkit-backface-visibility: hidden;
+            backface-visibility: hidden;
+            will-change: transform;
+            outline: 1px solid transparent;
+        }
+
+        /* 3. 第1层圆弧（内层） */
+        .voice-wave-icon .wave1 {
+            width: 13px;
+            height: 13px;
+        }
+
+        /* 4. 第2层圆弧（外层） */
+        .voice-wave-icon .wave2 {
+            width: 25px;
+            height: 25px;
+        }
+
+        /* 新增：TTS 播放按钮样式 */
+        .tts-btn {
+            background: none;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            cursor: pointer;
+            padding: 4px 8px;
+            font-size: 16px;
+            transition: all 0.2s;
+            color: #666;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .tts-btn:hover {
+            background-color: #f0f0f0;
+            color: #333;
+            transform: scale(1.1);
+        }
+
+        .tts-btn.playing {
+            color: #42b883;
+            border-color: #42b883;
+            background-color: #e8f5f0;
+        }
+        
+        .tts-btn.disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+    </style>
+</head>
+<body>
+    <div class="app-layout">
+        <!-- 左侧会话栏 (DeepSeek 式): 新建对话 + 历史会话列表 -->
+        <aside class="session-sidebar">
+            <button class="new-session-btn" id="new-session-btn">＋ 新对话</button>
+            <div class="session-list-title">历史对话</div>
+            <div class="session-list" id="sessionList"></div>
+        </aside>
+
+        <div class="chat-container">
+            <div class="chat-header">
+            <h1>🏥 AI健康医生</h1>
+            <p>24小时在线 · 专业健康咨询</p>
+            <!-- 登录状态栏: 显示当前用户 + 退出登录 -->
+            <div id="user-bar" style="margin-top:8px; font-size:13px; display:flex; justify-content:center; align-items:center; gap:12px;">
+                <span id="user-bar-name"></span>
+                <a href="#" id="logout-btn" style="color:#fff; text-decoration:underline;">退出登录</a>
+            </div>
+            <!-- 【新增】模式切换按钮移到这里 -->
+            <div class="mode-switch-container">
+                <button id="quick-mode-btn" class="mode-btn active">⚡ 快速模式</button>
+                <button id="expert-mode-btn" class="mode-btn">💎 专家模式</button>
+            </div>
+        </div>
+        
+        <div class="chat-messages" id="chatMessages">
+            <div class="message ai-message">
+                你好！我是AI健康医生，很高兴为你服务。<br><br>
+                你可以咨询：<br>
+                • 身体不适症状<br>
+                • 日常保健建议<br>
+                • 用药疑问解答<br>
+                • 常见健康问题<br><br>
+                温馨提示：结果仅供参考，不能替代医院诊断😊
+            </div>
+        </div>
+        
+        <div class="input-area">
+            <!-- 1. 模式切换按钮 -->
+            <button id="mode-toggle-btn" title="切换输入模式">
+                ⌨️ <!-- 默认显示键盘图标，表示当前是语音模式，点击可切回文本；或者反之，看初始状态 -->
+            </button>
+
+            <!-- 2. 文本输入视图 (默认显示) -->
+            <div id="text-input-view" style="display: flex; flex: 1; gap: 12px;">
+                <textarea id="user-input" placeholder="请输入你的健康问题..." rows="1"></textarea>
+                <button id="send-btn">发送</button>
+            </div>
+
+            <!-- 3. 语音输入视图 (默认隐藏) -->
+            <div id="voice-input-view" style="display: none; flex: 1;">
+                <button id="voice-hold-btn">按住 说话</button>
+            </div>
+        </div>
+        </div>
+    </div>
+    
+    <!-- 新增：右侧预览栏 -->
+    <div class="preview-overlay" id="previewOverlay"></div>
+    <div class="preview-sidebar" id="previewSidebar">
+        <div class="preview-header">
+            <span class="preview-title" id="previewTitle">文档预览</span>
+            <button class="close-preview-btn" id="closePreviewBtn">&times;</button>
+        </div>
+        
+        <!-- 修改：使用 div 容器代替 iframe，用于 PDF.js 渲染 -->
+        <div class="preview-content" id="previewContentContainer">
+            <div id="pdf-render-container"></div>
+            <div class="preview-placeholder" id="previewPlaceholder" style="display:none;">
+                <p>无法直接预览此格式，请下载查看</p>
+                <a id="downloadLink" href="#" target="_blank" style="color:#42b883; margin-top:10px;">点击下载</a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const chatMessages = document.getElementById('chatMessages');
+        const userInput = document.getElementById('user-input');
+        const sendBtn = document.getElementById('send-btn');
+        
+        // 预览栏相关 DOM
+        const previewSidebar = document.getElementById('previewSidebar');
+        const previewOverlay = document.getElementById('previewOverlay');
+        const previewFrame = document.getElementById('previewFrame');
+        const previewTitle = document.getElementById('previewTitle');
+        const closePreviewBtn = document.getElementById('closePreviewBtn');
+        const previewPlaceholder = document.getElementById('previewPlaceholder');
+        const downloadLink = document.getElementById('downloadLink');
+         // ... 其他 DOM 获取代码 ...
+        const previewContentContainer = document.getElementById('previewContentContainer'); // 新增获取
+        const pdfRenderContainer = document.getElementById('pdf-render-container'); // 新增获取
+
+        // --- 新增：Textarea 自动增高逻辑 ---
+        function autoResizeTextarea() {
+            userInput.style.height = 'auto'; // 先重置高度
+            userInput.style.height = (userInput.scrollHeight) + 'px'; // 设置为滚动高度
+            
+            // 如果内容为空，重置为最小高度（可选，保持美观）
+            if (userInput.value.trim() === '') {
+                userInput.style.height = 'auto'; 
+            }
+        }
+
+        // 监听输入事件，自动调整高度
+        userInput.addEventListener('input', autoResizeTextarea);
+
+        // 配置 marked 选项
+        marked.setOptions({
+            breaks: true, // 允许换行符转换为 <br>
+            gfm: true     // 启用 GitHub 风格的 Markdown
+        });
+
+        // 后端API地址
+        const API_URL = '/chat_stream';
+        const FEEDBACK_API_URL = '/feedback'; // 新增反馈接口地址
+
+        // ---- 登录态: 从 sessionStorage 读取 JWT (关闭浏览器后失效, 需重新登录) ----
+        const TOKEN = sessionStorage.getItem('token') || '';
+        if (!TOKEN) {
+            // 未登录 → 跳转登录页
+            location.href = '/login.html';
+        }
+        // 需要鉴权的请求统一带上 Bearer token
+        const AUTH_HEADERS = TOKEN ? { 'Authorization': 'Bearer ' + TOKEN } : {};
+
+        // 从 JWT payload 解析用户名 (与后端 user_id 保持一致)
+        function parseUsernameFromToken(t) {
+            try {
+                // base64url → base64 补齐并解码
+                const base64 = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+                const json = decodeURIComponent(atob(base64).split('').map(c =>
+                    '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+                return JSON.parse(json).username || '';
+            } catch (e) {
+                return '';
+            }
+        }
+
+        // 会话 id: 存 sessionStorage, 与本次登录会话同生命周期 (刷新仍续用, 关浏览器后重开则新建)
+        let SESSION_ID = sessionStorage.getItem('session_id');
+        if (!SESSION_ID) {
+            SESSION_ID = 'seid' + Date.now() + Math.random().toString(36).slice(2, 8);
+            sessionStorage.setItem('session_id', SESSION_ID);
+        }
+        const USER_ID = parseUsernameFromToken(TOKEN) || sessionStorage.getItem('username') || 'anonymous';
+
+        // 顶部展示当前用户 + 退出登录
+        (function initUserBar() {
+            const nameEl = document.getElementById('user-bar-name');
+            if (nameEl) nameEl.textContent = '👤 ' + (sessionStorage.getItem('nickname') || USER_ID);
+            const logoutBtn = document.getElementById('logout-btn');
+            if (logoutBtn) {
+                logoutBtn.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    sessionStorage.removeItem('token');
+                    sessionStorage.removeItem('username');
+                    sessionStorage.removeItem('nickname');
+                    sessionStorage.removeItem('session_id');
+                    location.href = '/login.html';
+                });
+            }
+        })();
+
+        // ---- 左侧会话栏 (DeepSeek 式): 历史会话列表 / 切换 / 新建 ----
+        const sessionListEl = document.getElementById('sessionList');
+        const newSessionBtn = document.getElementById('new-session-btn');
+        const SESSION_LIST_API = '/get_session_list';
+        const SESSION_MSG_API = '/get_session_messages';
+        // 记录初始欢迎语, 新建/空会话时还原
+        const WELCOME_HTML = chatMessages.innerHTML;
+
+        function setActiveSessionItem() {
+            if (!sessionListEl) return;
+            sessionListEl.querySelectorAll('.session-item').forEach(el => {
+                el.classList.toggle('active', el.dataset.sessionId === SESSION_ID);
+            });
+        }
+
+        function renderSessionList(list) {
+            if (!sessionListEl) return;
+            sessionListEl.innerHTML = '';
+            if (!list.length) {
+                const empty = document.createElement('div');
+                empty.className = 'session-empty';
+                empty.textContent = '暂无历史对话';
+                sessionListEl.appendChild(empty);
+                return;
+            }
+            list.forEach(item => {
+                const div = document.createElement('div');
+                div.className = 'session-item';
+                div.dataset.sessionId = item.session_id;
+                div.textContent = item.topic || '未命名对话';
+                div.title = item.topic || '';
+                if (item.session_id === SESSION_ID) div.classList.add('active');
+                div.addEventListener('click', () => switchSession(item.session_id));
+                sessionListEl.appendChild(div);
+            });
+        }
+
+        async function loadSessionList() {
+            try {
+                const resp = await fetch(SESSION_LIST_API, {
+                    method: 'POST',
+                    headers: Object.assign({ 'Content-Type': 'application/json' }, AUTH_HEADERS),
+                    body: JSON.stringify({ username: USER_ID })
+                });
+                const result = await resp.json();
+                renderSessionList((result && result.data) || []);
+            } catch (e) {
+                console.error('加载会话列表失败:', e);
+            }
+        }
+
+        async function fetchSessionMessages(sessionId) {
+            try {
+                const resp = await fetch(SESSION_MSG_API, {
+                    method: 'POST',
+                    headers: Object.assign({ 'Content-Type': 'application/json' }, AUTH_HEADERS),
+                    body: JSON.stringify({ username: USER_ID, session_id: sessionId })
+                });
+                const result = await resp.json();
+                return (result && result.data) || [];
+            } catch (e) {
+                console.error('加载历史消息失败:', e);
+                return [];
+            }
+        }
+
+        function renderHistoryMessages(msgs) {
+            chatMessages.innerHTML = '';
+            msgs.forEach(m => addMessage(m.message, m.sender === 'bot' ? 'ai' : 'user'));
+        }
+
+        async function switchSession(sessionId) {
+            if (sessionId === SESSION_ID) return;
+            SESSION_ID = sessionId;
+            sessionStorage.setItem('session_id', SESSION_ID);
+            setActiveSessionItem();
+            const msgs = await fetchSessionMessages(sessionId);
+            if (msgs.length) {
+                renderHistoryMessages(msgs);
+            } else {
+                chatMessages.innerHTML = WELCOME_HTML;
+            }
+        }
+
+        function newSession() {
+            SESSION_ID = 'seid' + Date.now() + Math.random().toString(36).slice(2, 8);
+            sessionStorage.setItem('session_id', SESSION_ID);
+            setActiveSessionItem();
+            chatMessages.innerHTML = WELCOME_HTML;
+            userInput.focus();
+        }
+
+        if (newSessionBtn) newSessionBtn.addEventListener('click', newSession);
+
+        // 初始化: 尝试恢复本次会话的历史消息, 并加载左侧会话列表
+        (async function initSessions() {
+            const msgs = await fetchSessionMessages(SESSION_ID);
+            if (msgs.length) renderHistoryMessages(msgs);
+            await loadSessionList();
+        })();
+
+        // --- 预览栏控制逻辑 ---
+
+        
+        async function openPreview(url, title) {
+            previewTitle.textContent = title || '文档预览';
+            previewSidebar.classList.add('active');
+            previewOverlay.classList.add('active');
+            
+            // 重置状态
+            pdfRenderContainer.innerHTML = ''; // 清空之前的 PDF 渲染内容
+            document.getElementById('previewPlaceholder').style.display = 'none';
+            
+            const lowerUrl = url.toLowerCase();
+            
+            if (lowerUrl.endsWith('.pdf')) {
+                // 使用 PDF.js 渲染
+                renderPDF(url);
+            } else if (lowerUrl.endsWith('.doc') || lowerUrl.endsWith('.docx')) {
+                // Word 文档：由于前端难以完美渲染 Word，且微软预览服务需要 iframe
+                // 我们动态创建一个临时的 iframe 插入到容器中
+                pdfRenderContainer.innerHTML = ''; // 确保清空
+                
+                const iframe = document.createElement('iframe');
+                iframe.style.width = '100%'; // 设置宽度为100%
+                iframe.style.height = '100%'; // 设置高度为100%
+                iframe.style.border = 'none';
+                iframe.style.overflow = 'auto'; // 允许内部滚动
+                iframe.style.minHeight = '300px'; // 设置最小高度，防止过小
+                iframe.style.maxHeight = 'calc(100vh - 100px)'; // 设置最大高度，防止超出屏幕
+                // 使用微软在线预览
+                iframe.src = `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(url)}`;
+                
+                pdfRenderContainer.appendChild(iframe);
+            }// --- 新增开始：支持 TXT 和 MD ---
+            else if (lowerUrl.endsWith('.txt') || lowerUrl.endsWith('.md')) {
+                // 使用自定义函数渲染文本或 Markdown
+                renderTextOrMarkdown(url, lowerUrl.endsWith('.md'));
+            }
+            // --- 新增结束 ---
+            else {
+                // 其他不支持的类型
+                document.getElementById('previewPlaceholder').style.display = 'flex';
+                document.getElementById('downloadLink').href = url;
+            }
+        }
+
+        /**
+         * 使用 PDF.js 渲染 PDF
+         */
+        async function renderPDF(url) {
+            try {
+                // 显示加载提示
+                pdfRenderContainer.innerHTML = '<div class="pdf-loading-text">正在加载 PDF...</div>';
+
+                // 加载文档
+                const loadingTask = pdfjsLib.getDocument(url);
+                const pdf = await loadingTask.promise;
+
+                // 清空加载提示
+                pdfRenderContainer.innerHTML = '';
+
+                // 逐页渲染
+                for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                    const page = await pdf.getPage(pageNum);
+                    
+                    // 设置缩放比例 (1.5 倍清晰度)
+                    const viewport = page.getViewport({ scale: 1.5 });
+                    
+                    // 创建 Canvas
+                    const canvas = document.createElement('canvas');
+                    const context = canvas.getContext('2d');
+                    canvas.height = viewport.height;
+                    canvas.width = viewport.width;
+                    canvas.className = 'pdf-page-canvas';
+
+                    // 渲染页面
+                    const renderContext = {
+                        canvasContext: context,
+                        viewport: viewport
+                    };
+                    
+                    await page.render(renderContext).promise;
+                    
+                    // 添加到容器
+                    pdfRenderContainer.appendChild(canvas);
+                }
+
+            } catch (error) {
+                console.error('PDF 渲染失败:', error);
+                pdfRenderContainer.innerHTML = `
+                    <div style="color:white; text-align:center; padding:20px;">
+                        <p>PDF 加载失败，可能是跨域限制。</p>
+                        <a href="${url}" target="_blank" style="color:#42b883; text-decoration:underline;">点击此处下载或在新窗口打开</a>
+                    </div>
+                `;
+            }
+        }
+
+         /**
+         * 渲染 TXT 或 Markdown 文件
+         * @param {string} url - 文件地址
+         * @param {boolean} isMarkdown - 是否为 Markdown 格式
+         */
+        async function renderTextOrMarkdown(url, isMarkdown) {
+            try {
+                // 显示加载提示
+                pdfRenderContainer.innerHTML = '<div class="pdf-loading-text">正在加载文档...</div>';
+
+                // 获取文件内容
+                const response = await fetch(url);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const text = await response.text();
+
+                // 清空加载提示
+                pdfRenderContainer.innerHTML = '';
+
+                // 创建内容容器
+                const contentDiv = document.createElement('div');
+                
+                // 样式优化：让文本在深色背景上更易读，或者保持白色背景
+                // 这里我们创建一个白色背景的卡片式容器，因为 .preview-content 背景是深灰色的
+                contentDiv.style.backgroundColor = '#fff';
+                contentDiv.style.color = '#333';
+                contentDiv.style.padding = '20px';
+                contentDiv.style.borderRadius = '8px';
+                contentDiv.style.width = '90%';
+                contentDiv.style.maxWidth = '800px';
+                contentDiv.style.margin = '20px auto';
+                contentDiv.style.boxShadow = '0 2px 10px rgba(0,0,0,0.1)';
+                contentDiv.style.overflowWrap = 'break-word'; // 防止长单词溢出
+                contentDiv.style.lineHeight = '1.6';
+
+                if (isMarkdown) {
+                    // 如果是 Markdown，使用 marked.js 解析
+                    // 注意：marked.parse 返回的是 HTML 字符串
+                    contentDiv.innerHTML = marked.parse(text);
+                    
+                    // 可选：为 markdown 生成的图片添加样式限制
+                    const imgs = contentDiv.querySelectorAll('img');
+                    imgs.forEach(img => {
+                        img.style.maxWidth = '100%';
+                        img.style.height = 'auto';
+                        img.style.borderRadius = '4px';
+                    });
+                } else {
+                    // 如果是 TXT，保留换行符并转义 HTML 以防 XSS
+                    // pre-wrap 保留空格和换行
+                    contentDiv.style.whiteSpace = 'pre-wrap'; 
+                    contentDiv.style.fontFamily = 'monospace'; // 纯文本通常用等宽字体好看些，或者去掉这行用默认字体
+                    contentDiv.textContent = text;
+                }
+
+                pdfRenderContainer.appendChild(contentDiv);
+
+            } catch (error) {
+                console.error('文档加载失败:', error);
+                pdfRenderContainer.innerHTML = `
+                    <div style="color:white; text-align:center; padding:20px;">
+                        <p>文档加载失败: ${error.message}</p>
+                        <p>可能是跨域(CORS)限制，浏览器禁止直接读取远程文本文件。</p>
+                        <a href="${url}" target="_blank" style="color:#42b883; text-decoration:underline;">点击此处下载或在新窗口打开</a>
+                    </div>
+                `;
+            }
+        }
+
+        function closePreview() {
+            previewSidebar.classList.remove('active');
+            previewOverlay.classList.remove('active');
+            // 延迟清空 src 以优化动画性能
+            setTimeout(() => {
+                previewFrame.src = '';
+            }, 300);
+        }
+
+        // 绑定关闭事件
+        closePreviewBtn.addEventListener('click', closePreview);
+        previewOverlay.addEventListener('click', closePreview);
+
+        // --- 消息发送与渲染逻辑 ---
+
+        async function sendMessage() {
+            const rawMsg = userInput.value;
+            
+            // 【修改点1】只去除首尾空白，保留内部的换行符 \n
+            const msg = rawMsg.trim();
+            
+            // 1. 空值检查
+            if (!msg) {
+                alert("请输入您的问题");
+                return;
+            }
+
+            // 获取当前模式
+            const thinkType = document.querySelector('.mode-btn.active').id === 'expert-mode-btn' ? 'enabled' : 'disabled';
+
+
+            // 禁用输入框和按钮，防止重复发送
+            userInput.disabled = true;
+            sendBtn.disabled = true;
+            sendBtn.innerText = '发送中...';
+
+            // 添加用户消息
+            addMessage(msg, 'user');
+             // 清空输入框并重置高度
+            userInput.value = '';
+            userInput.style.height = 'auto'; 
+
+            // 3. 创建 AI 消息容器并显示“正在思考”状态
+            const aiMsgDiv = document.createElement('div');
+            aiMsgDiv.className = 'message ai-message';
+            // 使用更明显的加载结构
+            aiMsgDiv.innerHTML = `
+                <div class="typing-indicator">
+                    <div class="typing-dot"></div>
+                    <div class="typing-dot"></div>
+                    <div class="typing-dot"></div>
+                    <span class="thinking-text">AI医生正在思考...</span>
+                </div>
+            `;
+            chatMessages.appendChild(aiMsgDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+
+            let fullText = '';
+            let isFirstChunk = true;
+
+            try {
+                // 2. 发起流式请求
+                const response = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        ...AUTH_HEADERS
+                    },
+                    body: JSON.stringify({ 
+                        question: msg,
+                        think_type: thinkType,  // 👈 添加参数
+                        session_id: SESSION_ID,
+                        username: USER_ID
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                
+                // 3. 处理流式响应
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder("utf-8");
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    // 解码数据块
+                    const chunk = decoder.decode(value, { stream: true });
+                    
+                    // 如果是第一个数据块，清除“正在思考”动画，避免闪烁
+                    if (isFirstChunk) {
+                        aiMsgDiv.innerHTML = ''; 
+                        isFirstChunk = false;
+                    }
+                    
+                    fullText += chunk;
+
+                    // 优化：流式场景下的图片链接匹配（避免半链接错误）
+                    let processedText = fullText; // ✅ 关键：初始化 processedText
+                    processedText = processedText.replace(
+                        /(!?\[(.*?)\]\((https?:\/\/[^\s)]+?\.(png|jpg|jpeg|gif|webp))\))|(https?:\/\/[^\s]+?\.(png|jpg|jpeg|gif|webp))/gi,
+                        (match, mdImg, alt, url, ext1, pureUrl, ext2) => {
+                            // 已经是标准Markdown图片语法，直接返回
+                            if (mdImg) return mdImg;
+                            // 纯链接，转换为图片
+                            return `![](${pureUrl})`;
+                        }
+                    );
+                    
+                    // 2. 临时隐藏文档链接，防止 marked.js 将其渲染为普通 <a> 标签
+                    // 我们使用一个特殊的占位符来暂时替换掉 pdf/doc/docx 链接
+                    // 这样 marked.js 就不会把它们变成普通的蓝色下划线链接
+                    const docLinksMap = new Map();
+                    let placeholderIndex = 0;
+                    
+                    processedText = processedText.replace(
+                        /\[([^\]]*)\]\((https?:\/\/[^\s)]+?\.(pdf|doc|docx|txt|md))\)/gi, 
+                        (match, text, url) => {
+                            const placeholder = `__DOC_LINK_PLACEHOLDER_${placeholderIndex++}__`;
+                            docLinksMap.set(placeholder, { text, url });
+                            return placeholder;
+                        }
+                    );
+                    
+                    // 同时也匹配没有文字描述的纯文档链接 [url](url) 或 纯url
+                    processedText = processedText.replace(
+                        /(https?:\/\/[^\s]+?\.(pdf|doc|docx|txt|md))/gi,
+                        (match, url) => {
+                             // 如果这个URL已经被上面的逻辑处理过（在括号里），这里可能会重复，但通常正则匹配互斥
+                             // 为了简单起见，我们只处理标准的 Markdown 链接格式 [text](url)
+                             // 如果 AI 输出的是纯文本 URL，marked.js 会自动变链接，我们在后续步骤处理
+                             return match; 
+                        }
+                    );
+
+                    // 3. 渲染 Markdown
+                    aiMsgDiv.innerHTML = marked.parse(processedText);
+
+                    // 4. 恢复文档链接为自定义按钮
+                    // 遍历之前保存的占位符，替换为真实的按钮 DOM
+                    docLinksMap.forEach((data, placeholder) => {
+                        const btn = document.createElement('div');
+                        btn.className = 'doc-link-btn';
+                        
+                        let icon = '📄';
+                        if (data.url.toLowerCase().endsWith('.pdf')) icon = '📕';
+                        if (data.url.toLowerCase().endsWith('.doc') || data.url.toLowerCase().endsWith('.docx')) icon = '📘';
+
+                        btn.innerHTML = `<span class="doc-icon">${icon}</span> <span>${data.text || '查看文档'}</span>`;
+                        
+                        btn.onclick = (e) => {
+                            e.preventDefault();
+                            openPreview(data.url, data.text);
+                        };
+
+                        // 在 DOM 中找到包含占位符文本的节点并替换
+                        // 注意：marked.parse 后，占位符可能在文本节点中
+                        const walker = document.createTreeWalker(aiMsgDiv, NodeFilter.SHOW_TEXT, null, false);
+                        let node;
+                        while (node = walker.nextNode()) {
+                            if (node.textContent.includes(placeholder)) {
+                                const span = document.createElement('span');
+                                span.appendChild(btn);
+                                node.parentNode.replaceChild(span, node);
+                                break; // 找到并替换一个即可
+                            }
+                        }
+                    });
+
+                    // 5. 处理那些可能被 marked.js 渲染成普通 <a> 标签的纯文档链接（兜底逻辑）
+                    // 这一步确保即使没有匹配到 Markdown 格式，纯 URL 也能被转换
+                    const remainingLinks = aiMsgDiv.querySelectorAll('a');
+                    remainingLinks.forEach(link => {
+                        const href = link.href;
+                        if (href.match(/\.(pdf|doc|docx|txt|md)$/i)) {
+                            const btn = document.createElement('div');
+                            btn.className = 'doc-link-btn';
+                            let icon = '📎';
+                            if (href.toLowerCase().endsWith('.pdf')) icon = '📄';
+                            if (href.toLowerCase().endsWith('.doc') || href.toLowerCase().endsWith('.docx')) icon = '📝';
+                            
+                            // 尝试获取链接文本，如果没有则用文件名
+                            let linkText = link.textContent || href.split('/').pop();
+                            btn.innerHTML = `<span class="doc-icon">${icon}</span> <span>${linkText}</span>`;
+                            
+                            btn.onclick = (e) => {
+                                e.preventDefault();
+                                openPreview(href, linkText);
+                            };
+                            link.parentNode.replaceChild(btn, link);
+                        }
+                    });
+
+                    // 保持滚动到底部
+                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                }
+
+                // 【关键修改】流式回答完毕后，添加反馈按钮
+                appendFeedbackButtons(aiMsgDiv, fullText);
+                // 2. 处理文档链接，将其转换为预览按钮
+                processDocumentLinks(aiMsgDiv);
+
+                // 3. 【重要】再次滚动到底部，确保新添加的按钮完全可见
+                // 使用 setTimeout 确保 DOM 更新完成后执行滚动
+                setTimeout(() => {
+                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                }, 0);
+
+            } catch (error) {
+                console.error('Error:', error);
+                aiMsgDiv.innerHTML = `<span style="color:red;">请求失败: ${error.message}</span>`;
+            } finally {
+                // 恢复输入状态
+                userInput.disabled = false;
+                sendBtn.disabled = false;
+                sendBtn.innerText = '发送';
+                userInput.focus();
+
+                // 刷新左侧会话列表 (新会话/最新消息置顶)
+                loadSessionList();
+                
+                 // 如果因为某种原因没有收到任何数据（fullText为空），给个默认提示
+                if (fullText === '' && !aiMsgDiv.innerHTML.includes('连接失败')) {
+                     aiMsgDiv.innerHTML = '<span style="color:#666;">(未收到回复，请重试)</span>';
+                     // 同样需要滚动
+                     setTimeout(() => {
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                    }, 0);
+                }
+            }
+        }
+
+        /**
+         * 处理消息中的文档链接，替换为预览按钮
+         */
+        function processDocumentLinks(messageContainer) {
+            // 获取所有链接
+            const links = messageContainer.querySelectorAll('a');
+            
+            links.forEach(link => {
+                const href = link.href;
+                const text = link.textContent || link.innerText;
+                
+                // 检查是否是 pdf, doc, docx
+                if (href.match(/\.(pdf|doc|docx|txt|md)$/i)) {
+                    // 创建自定义按钮
+                    const btn = document.createElement('div');
+                    btn.className = 'doc-link-btn';
+                    
+                    // 【修改点2】：增加 txt 和 md 的图标判断
+                    let icon = '📄'; // 默认图标
+                    const lowerHref = href.toLowerCase();
+                    
+                    if (lowerHref.endsWith('.pdf')) {
+                        icon = '📕';
+                    } else if (lowerHref.endsWith('.doc') || lowerHref.endsWith('.docx')) {
+                        icon = '📘';
+                    } else if (lowerHref.endsWith('.txt')) {
+                        icon = '📃'; // 文本文件图标
+                    } else if (lowerHref.endsWith('.md')) {
+                        icon = '📝'; // Markdown 文件图标
+                    }
+                    
+                    btn.innerHTML = `<span class="doc-icon">${icon}</span> <span>${text || '查看文档'}</span>`;
+                    
+                    // 绑定点击事件打开预览
+                    btn.onclick = (e) => {
+                        e.preventDefault();
+                        openPreview(href, text);
+                    };
+
+                    // 替换原链接
+                    link.parentNode.replaceChild(btn, link);
+                }
+            });
+        }
+
+                /**
+         * 新增函数：添加 TTS 喇叭按钮 和 点赞/点踩按钮
+         * @param {HTMLElement} messageContainer - AI消息的DOM容器
+         * @param {string} content - 消息原始文本内容（用于TTS）
+         */
+        function appendFeedbackButtons(messageContainer, content) {
+            // 1. 将原始文本存储在容器上，方便后续读取（防止 HTML 解析后丢失格式）
+            messageContainer.dataset.originalText = content;
+
+            // 创建反馈容器
+            const feedbackDiv = document.createElement('div');
+            feedbackDiv.className = 'feedback-area';
+
+            // --- 新增：创建 TTS 喇叭按钮 ---
+            const ttsBtn = document.createElement('button');
+            ttsBtn.className = 'tts-btn';
+            ttsBtn.innerHTML = '🔊'; // 喇叭图标
+            ttsBtn.title = '朗读内容';
+            
+            // 绑定 TTS 点击事件
+            ttsBtn.onclick = () => handleTtsClick(ttsBtn, content);
+            
+            // 将 TTS 按钮插入到最左侧
+            feedbackDiv.appendChild(ttsBtn);
+            // -------------------------
+
+            // 创建点赞按钮
+            const thumbsUpBtn = document.createElement('button');
+            thumbsUpBtn.className = 'feedback-btn';
+            thumbsUpBtn.innerHTML = '👍';
+            thumbsUpBtn.title = '有用';
+
+            // 创建点踩按钮
+            const thumbsDownBtn = document.createElement('button');
+            thumbsDownBtn.className = 'feedback-btn';
+            thumbsDownBtn.innerHTML = '👎';
+            thumbsDownBtn.title = '无用/有误';
+
+            // 绑定点击事件
+            thumbsUpBtn.onclick = () => handleFeedbackClick(thumbsUpBtn, thumbsDownBtn, 'thumbs_up');
+            thumbsDownBtn.onclick = () => handleFeedbackClick(thumbsDownBtn, thumbsUpBtn, 'thumbs_down');
+
+            feedbackDiv.appendChild(thumbsUpBtn);
+            feedbackDiv.appendChild(thumbsDownBtn);
+
+            // 将反馈区域添加到消息容器底部
+            messageContainer.appendChild(feedbackDiv);
+        }
+
+        /**
+         * 处理反馈点击
+         * @param {HTMLElement} clickedBtn - 被点击的按钮
+         * @param {HTMLElement} otherBtn - 另一个按钮（用于互斥状态）
+         * @param {string} type - 'thumbs_up' 或 'thumbs_down'
+         */
+        async function handleFeedbackClick(clickedBtn, otherBtn, type) {
+            // 防止重复提交
+            if (clickedBtn.classList.contains('active') || clickedBtn.classList.contains('disabled')) {
+                return;
+            }
+
+            // UI 更新：禁用两个按钮，高亮当前按钮
+            clickedBtn.classList.add('active');
+            otherBtn.classList.add('disabled');
+            clickedBtn.disabled = true;
+            otherBtn.disabled = true;
+
+            try {
+                // 发送请求到后端
+                const response = await fetch(FEEDBACK_API_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        session_id: SESSION_ID,
+                        user_id: USER_ID,
+                        feedback: type
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error('反馈提交失败');
+                }
+
+                const result = await response.json();
+                console.log('反馈成功:', result);
+                
+                // 可选：显示简单的提示 Toast 或改变按钮颜色表示成功
+                // 这里我们依靠 .active 类的绿色边框已经给出了视觉反馈
+
+            } catch (error) {
+                console.error('反馈错误:', error);
+                alert('反馈提交失败，请稍后重试');
+                
+                // 出错时恢复按钮状态
+                clickedBtn.classList.remove('active');
+                otherBtn.classList.remove('disabled');
+                clickedBtn.disabled = false;
+                otherBtn.disabled = false;
+            }
+        }
+
+        function addMessage(text, sender, isHtml = false) {
+            const div = document.createElement('div');
+            div.className = `message ${sender}-message`;
+            
+            if (sender === 'user') {
+                if (isHtml) {
+                    // 如果是 HTML (如语音播放器)，直接插入
+                    div.innerHTML = text;
+                } else {
+                    // 普通文本，进行转义防止 XSS
+                    const safeText = text
+                        .replace(/&/g, "&amp;")
+                        .replace(/</g, "&lt;")
+                        .replace(/>/g, "&gt;")
+                        .replace(/"/g, "&quot;")
+                        .replace(/'/g, "&#039;");
+                    div.innerHTML = safeText.replace(/\n/g, '<br>');
+                }
+            } else {
+                // AI 消息始终使用 Markdown 解析
+                div.innerHTML = marked.parse(text);
+            }
+            chatMessages.appendChild(div);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        // 绑定事件
+        sendBtn.addEventListener('click', sendMessage);
+        
+        // 修改键盘事件监听
+        userInput.addEventListener('keydown', e => {
+            // Enter 发送，Shift+Enter 换行
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault(); // 阻止默认的换行行为
+                sendMessage();
+            }
+        });
+        
+        // 初始化时也可能需要调整一次高度（防止页面刷新后残留高度）
+        window.addEventListener('load', () => {
+             userInput.style.height = 'auto';
+        });
+
+        // --- 新增：输入模式切换逻辑 ---
+        const modeToggleBtn = document.getElementById('mode-toggle-btn');
+        const textInputView = document.getElementById('text-input-view');
+        const voiceInputView = document.getElementById('voice-input-view');
+        const voiceHoldBtn = document.getElementById('voice-hold-btn');
+        
+        let currentMode = 'text'; // 'text' or 'voice'
+
+        function toggleInputMode() {
+            if (currentMode === 'text') {
+                // 切换到语音模式
+                currentMode = 'voice';
+                textInputView.style.display = 'none';
+                voiceInputView.style.display = 'block';
+                // modeToggleBtn.innerHTML = '·))'; // 显示麦克风图标，提示当前是语音模式，点击可切回键盘? 不，通常图标表示“点击切换到该模式”或者“当前模式”。
+                // 微信逻辑：图标显示的是“另一种模式”。如果当前是文本，图标是麦克风(点击变语音)。如果当前是语音，图标是键盘(点击变文本)。
+                modeToggleBtn.innerHTML = '⌨️'; // 当前是语音，显示键盘图标，暗示可以点击切回键盘
+                userInput.blur(); // 收起键盘
+            } else {
+                currentMode = 'text';
+                voiceInputView.style.display = 'none';
+                textInputView.style.display = 'flex';
+                // ✅ 最终效果：圆圈 + 圆点 + 两条弧线
+                modeToggleBtn.innerHTML = `
+                    <div class="voice-wave-icon">
+                        <div class="dot"></div>
+                        <span class="wave1"></span>
+                        <span class="wave2"></span>
+                    </div>
+                `;
+                userInput.focus();
+            }
+        }
+
+        modeToggleBtn.addEventListener('click', toggleInputMode);
+
+        // 初始化图标
+        // ✅ 最终效果：圆圈 + 圆点 + 两条弧线
+        modeToggleBtn.innerHTML = `
+            <div class="voice-wave-icon">
+                <div class="dot"></div>
+                <span class="wave1"></span>
+                <span class="wave2"></span>
+            </div>
+        `;
+
+// --- 新增：语音录音逻辑 (优化版 - 兼容 iOS) ---
+        let recorder = null; 
+        let isRecording = false;
+        let recordStartTime = 0;
+        let audioStream = null; // 保存流以便关闭
+        const MIN_RECORD_TIME = 800; // 稍微降低最短时间，提升响应感
+
+        /**
+         * 生成随机文件名
+         */
+        function generateFileName() {
+            const timestamp = new Date().getTime();
+            const randomStr = Math.random().toString(36).substring(2, 8);
+            return `voice_${timestamp}_${randomStr}.mp3`;
+        }
+        /**
+         * 获取 OSS 上传签名
+         */
+        async function getOssSignature(fileName) {
+            try {
+                // 注意：确保后端允许 .mp3 后缀的文件上传
+                const response = await fetch(`/get_oss_sign?fileName=${encodeURIComponent(fileName)}`);
+                if (!response.ok) {
+                    throw new Error('获取OSS签名失败');
+                }
+                return await response.json();
+            } catch (error) {
+                console.error('Get OSS Sign Error:', error);
+                alert('无法获取上传权限，请检查网络或联系管理员');
+                return null;
+            }
+        }
+
+        /**
+         * 上传文件到 OSS
+         */
+        async function uploadToOss(file, signData) {
+            const formData = new FormData();
+            formData.append('key', signData.fileName);
+            formData.append('policy', signData.policy);
+            formData.append('OSSAccessKeyId', signData.accessKeyId);
+            formData.append('signature', signData.signature);
+            formData.append('success_action_status', '200');
+            formData.append('file', file);
+
+            try {
+                const response = await fetch(signData.host, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (response.ok || response.status === 200 || response.status === 204) {
+                    return `${signData.host}/${signData.fileName}`;
+                } else {
+                    const errText = await response.text();
+                    console.error('OSS Upload Error Response:', errText);
+                    throw new Error('OSS上传失败');
+                }
+            } catch (error) {
+                console.error('Upload Error:', error);
+                throw error;
+            }
+        }
+
+ /**
+         * 开始录音 (核心修改：适配 iOS)
+         */
+        async function startRecording() {
+            if (isRecording) return; 
+            
+            // UI 立即反馈，防止用户以为没点到
+            voiceHoldBtn.classList.add('recording');
+            voiceHoldBtn.innerText = '松开 结束';
+
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                alert('您的浏览器不支持录音功能');
+                resetVoiceBtnUI();
+                return;
+            }
+
+            try {
+                // 1. 获取音频流 (iOS 必须在此处触发用户手势后的权限请求)
+                audioStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true, // 回声消除
+                        noiseSuppression: true, // 降噪
+                        sampleRate: 16000       // 尝试指定采样率
+                    } 
+                });
+
+                // 2. 初始化 RecordRTC
+                // iOS Safari 14.3+ 支持 MediaRecorder，但格式通常是 mp4。
+                // RecordRTC 会尝试使用 lamejs 转 mp3。
+                recorder = new RecordRTC(audioStream, {
+                    type: 'audio',
+                    mimeType: 'audio/mp3', 
+                    numberOfAudioChannels: 1,
+                    desiredSampRate: 16000,
+                    // 关键：iOS 上可能需要稍长的缓冲才能正确编码，或者使用 default
+                    timeSlice: 1000, 
+                    ondataavailable: function(blob) {
+                        // 实时数据可用（可选）
+                    },
+                    onstop: function() {
+                        // 录音停止后的处理逻辑移到外面统一处理，这里只负责清理
+                    }
+                });
+
+                recorder.startRecording();
+                isRecording = true;
+                recordStartTime = Date.now();
+                
+                console.log('录音已开始');
+
+            } catch (err) {
+                console.error('Microphone Error:', err);
+                alert('无法访问麦克风，请在设置中允许权限');
+                resetVoiceBtnUI();
+            }
+        }
+
+        /**
+         * 停止录音
+         */
+        function stopRecording() {
+            if (!isRecording || !recorder) {
+                resetVoiceBtnUI();
+                return;
+            }
+
+            // 立即更新 UI 为“处理中”，避免用户再次点击
+            voiceHoldBtn.innerText = '⏳ 处理中...';
+            
+            // 记录是否正在录音，防止重复调用
+            isRecording = false;
+
+            // RecordRTC 的 stop 是异步的
+            recorder.stopRecording(function() {
+                const audioBlob = recorder.getBlob();
+                
+                // 清理资源
+                if (audioStream) {
+                    audioStream.getTracks().forEach(track => track.stop());
+                    audioStream = null;
+                }
+                recorder = null;
+
+                const duration = Date.now() - recordStartTime;
+                
+                // 如果录音时间太短，可能是误触或权限弹窗导致
+                if (duration < MIN_RECORD_TIME) {
+                    console.warn('录音时间过短:', duration);
+                    // 可以选择提示，或者直接丢弃不上传
+                    // alert('录音时间太短'); 
+                    resetVoiceBtnUI();
+                    return;
+                }
+
+                // 构建 File 对象
+                const fileName = generateFileName();
+                // 注意：即使 RecordRTC 声称是 mp3，在某些旧浏览器可能是 webm 容器
+                // 但现代 iOS/Chrome 配合 lamejs 通常能产出正确的 mp3
+                const mp3File = new File([audioBlob], fileName, {
+                    type: 'audio/mp3',
+                    lastModified: Date.now()
+                });
+
+                // 执行上传
+                handleUploadAndSend(mp3File);
+            });
+        }
+
+
+        /**
+         * 处理上传并发送消息
+         */
+        async function handleUploadAndSend(file) {
+            try {
+                const signData = await getOssSignature(file.name);
+                
+                if (!signData) {
+                    resetVoiceBtnUI();
+                    return;
+                }
+
+                const ossUrl = await uploadToOss(file, signData);
+                
+                if (ossUrl) {
+                    sendVoiceMessage(ossUrl);
+                }
+            } catch (error) {
+                console.error(error);
+                alert('语音上传失败，请重试');
+                resetVoiceBtnUI();
+            }
+        }
+
+        /**
+         * 重置语音按钮 UI
+         */
+        function resetVoiceBtnUI() {
+            voiceHoldBtn.classList.remove('recording');
+            voiceHoldBtn.innerText = '按住 说话';
+        }
+
+        /**
+         * 发送语音消息
+         */
+        async function sendVoiceMessage(voiceUrl) {
+            // 1. 显示用户语音消息
+            const voiceHtml = `<audio controls src="${voiceUrl}" style="max-width: 100%; width: 200px;"></audio>`;
+            addMessage(voiceHtml, 'user', true); 
+            
+            // 2. 创建 AI 思考状态
+            const aiMsgDiv = document.createElement('div');
+            aiMsgDiv.className = 'message ai-message';
+            aiMsgDiv.innerHTML = `
+                <div class="typing-indicator">
+                    <div class="typing-dot"></div>
+                    <div class="typing-dot"></div>
+                    <div class="typing-dot"></div>
+                    <span class="thinking-text">AI医生正在听...</span>
+                </div>
+            `;
+            chatMessages.appendChild(aiMsgDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+
+            resetVoiceBtnUI();
+
+            // 3. 发起请求
+            try {
+                const response = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', ...AUTH_HEADERS },
+                    body: JSON.stringify({ 
+                        question: '', 
+                        voice_url: voiceUrl,
+                        session_id: SESSION_ID,
+                        username: USER_ID
+                    })
+                });
+
+                if (!response.ok) throw new Error('Network response was not ok');
+
+                // 4. 处理流式响应
+                await handleStreamResponseFull(response, aiMsgDiv);
+
+            } catch (error) {
+                console.error('Error:', error);
+                aiMsgDiv.innerHTML = `<span style="color:red;">请求失败: ${error.message}</span>`;
+            }
+        }
+
+        // --- 绑定语音按钮事件 (优化版 - 兼容 iOS) ---
+        
+        // 1. 触摸事件 (移动端优先)
+        voiceHoldBtn.addEventListener('touchstart', (e) => {
+            e.preventDefault(); // 防止滚动和长按菜单
+            startRecording();
+        }, { passive: false }); // 明确指定 non-passive 以允许 preventDefault
+        
+        voiceHoldBtn.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            stopRecording();
+        });
+        
+        // 防止手指滑出按钮区域导致录音无法停止
+        voiceHoldBtn.addEventListener('touchcancel', (e) => {
+             if (isRecording) {
+                stopRecording();
+            }
+        });
+
+        // 2. 鼠标事件 (桌面端兼容)
+        voiceHoldBtn.addEventListener('mousedown', (e) => {
+            // 仅在非触摸设备上生效，避免移动端触发两次
+            if (!('ontouchstart' in window)) {
+                startRecording();
+            }
+        });
+        
+        voiceHoldBtn.addEventListener('mouseup', (e) => {
+            if (!('ontouchstart' in window)) {
+                stopRecording();
+            }
+        });
+        
+        voiceHoldBtn.addEventListener('mouseleave', (e) => {
+            if (!('ontouchstart' in window) && isRecording) {
+                stopRecording();
+            }
+        });
+        
+        /**
+         * 完整的流式响应处理函数 (包含 Markdown, 图片, 文档链接处理)
+         * 从原 sendMessage 中提取并增强
+         */
+        async function handleStreamResponseFull(response, aiMsgDiv) {
+            let fullText = '';
+            let isFirstChunk = true;
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder("utf-8");
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value, { stream: true });
+                
+                if (isFirstChunk) {
+                    aiMsgDiv.innerHTML = ''; 
+                    isFirstChunk = false;
+                }
+                
+                fullText += chunk;
+
+                // --- 以下逻辑完全复用原 sendMessage 中的处理 ---
+                
+                // 1. 图片链接匹配
+                let processedText = fullText;
+                processedText = processedText.replace(
+                    /(!?\[(.*?)\]\((https?:\/\/[^\s)]+?\.(png|jpg|jpeg|gif|webp))\))|(https?:\/\/[^\s]+?\.(png|jpg|jpeg|gif|webp))/gi,
+                    (match, mdImg, alt, url, ext1, pureUrl, ext2) => {
+                        if (mdImg) return mdImg;
+                        return `![](${pureUrl})`;
+                    }
+                );
+                
+                // 2. 临时隐藏文档链接
+                const docLinksMap = new Map();
+                let placeholderIndex = 0;
+                
+                processedText = processedText.replace(
+                    /\[([^\]]*)\]\((https?:\/\/[^\s)]+?\.(pdf|doc|docx|txt|md))\)/gi, 
+                    (match, text, url) => {
+                        const placeholder = `__DOC_LINK_PLACEHOLDER_${placeholderIndex++}__`;
+                        docLinksMap.set(placeholder, { text, url });
+                        return placeholder;
+                    }
+                );
+
+                // 3. 渲染 Markdown
+                aiMsgDiv.innerHTML = marked.parse(processedText);
+
+                // 4. 恢复文档链接为自定义按钮
+                docLinksMap.forEach((data, placeholder) => {
+                    const btn = document.createElement('div');
+                    btn.className = 'doc-link-btn';
+                    
+                    let icon = '📄';
+                    const lowerUrl = data.url.toLowerCase();
+                    
+                    // 【补充】：增加 txt 和 md 的判断
+                    if (lowerUrl.endsWith('.pdf')) {
+                        icon = '📕';
+                    } else if (lowerUrl.endsWith('.doc') || lowerUrl.endsWith('.docx')) {
+                        icon = '📘';
+                    } else if (lowerUrl.endsWith('.txt')) {
+                        icon = '📃';
+                    } else if (lowerUrl.endsWith('.md')) {
+                        icon = '📝';
+                    }
+                    
+                    btn.innerHTML = `<span class="doc-icon">${icon}</span> <span>${data.text || '查看文档'}</span>`;
+                    
+                    btn.onclick = (e) => {
+                        e.preventDefault();
+                        openPreview(data.url, data.text);
+                    };
+
+                    const walker = document.createTreeWalker(aiMsgDiv, NodeFilter.SHOW_TEXT, null, false);
+                    let node;
+                    while (node = walker.nextNode()) {
+                        if (node.textContent.includes(placeholder)) {
+                            const span = document.createElement('span');
+                            span.appendChild(btn);
+                            node.parentNode.replaceChild(span, node);
+                            break;
+                        }
+                    }
+                });
+
+                // 5. 兜底处理纯链接
+                const remainingLinks = aiMsgDiv.querySelectorAll('a');
+                remainingLinks.forEach(link => {
+                    const href = link.href;
+                    if (href.match(/\.(pdf|doc|docx|txt|md)$/i)) {
+                         const btn = document.createElement('div');
+                        btn.className = 'doc-link-btn';
+                        let icon = '📎';
+                        const lowerHref = href.toLowerCase();
+                        if (lowerHref.endsWith('.pdf')) icon = '📄';
+                        else if (lowerHref.endsWith('.doc') || lowerHref.endsWith('.docx')) icon = '📝';
+                        else if (lowerHref.endsWith('.txt')) icon = '📃';
+                        else if (lowerHref.endsWith('.md')) icon = '📝';
+                        
+                        let linkText = link.textContent || href.split('/').pop();
+                        btn.innerHTML = `<span class="doc-icon">${icon}</span> <span>${linkText}</span>`;
+                        
+                        btn.onclick = (e) => {
+                            e.preventDefault();
+                            openPreview(href, linkText);
+                        };
+                        link.parentNode.replaceChild(btn, link);
+                    }
+                });
+
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+
+            // 结束后处理
+            appendFeedbackButtons(aiMsgDiv, fullText);
+            processDocumentLinks(aiMsgDiv); // 再次确保所有链接都被处理
+            
+            setTimeout(() => {
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }, 0);
+        }
+        
+        // --- 绑定语音按钮事件 (按住说话) ---
+        
+        // 鼠标事件
+        voiceHoldBtn.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            startRecording();
+        });
+        
+        voiceHoldBtn.addEventListener('mouseup', (e) => {
+            e.preventDefault();
+            stopRecording();
+        });
+        
+        voiceHoldBtn.addEventListener('mouseleave', (e) => {
+            if (isRecording) {
+                stopRecording();
+            }
+        });
+
+        // 触摸事件 (移动端)
+        voiceHoldBtn.addEventListener('touchstart', (e) => {
+            e.preventDefault(); // 防止滚动和长按菜单
+            startRecording();
+        });
+        
+        voiceHoldBtn.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            stopRecording();
+        });
+        
+        // 防止触摸移动时取消录音体验太差，可以选择性添加 touchcancel
+        voiceHoldBtn.addEventListener('touchcancel', (e) => {
+             if (isRecording) {
+                stopRecording();
+            }
+        });
+
+        // --- 新增：模式切换逻辑 ---
+        const quickModeBtn = document.getElementById('quick-mode-btn');
+        const expertModeBtn = document.getElementById('expert-mode-btn');
+
+        function setMode(type) {
+            if (type === 'quick') {
+                quickModeBtn.classList.add('active');
+                expertModeBtn.classList.remove('active');
+            } else {
+                expertModeBtn.classList.add('active');
+                quickModeBtn.classList.remove('active');
+            }
+        }
+
+        // 初始设置为快速模式
+        setMode('quick');
+
+        // 绑定点击事件
+        quickModeBtn.addEventListener('click', () => setMode('quick'));
+        expertModeBtn.addEventListener('click', () => setMode('expert'));
+
+
+        /**
+         * 处理 TTS 朗读点击
+         * @param {HTMLElement} btn - 被点击的喇叭按钮
+         * @param {string} text - 要朗读的文本
+         */
+        async function handleTtsClick(btn, text) {
+            // 如果正在播放，点击则停止
+            if (btn.classList.contains('playing')) {
+                stopCurrentAudio();
+                resetTtsBtn(btn);
+                return;
+            }
+
+            // 防止重复点击
+            if (btn.classList.contains('disabled')) return;
+
+            // UI 状态更新：显示加载中或播放中
+            btn.classList.add('disabled');
+            btn.innerHTML = '⏳'; // 加载图标
+
+            try {
+                // 1. 清理文本：去除 Markdown 符号、HTML 标签等，只保留纯文本供 TTS 使用
+                // 简单的清理策略：去除图片链接、文档链接标记，保留文字
+                let cleanText = text.replace(/!\[.*?\]\(.*?\)/g, '') // 去除图片 markdown
+                                    .replace(/\[.*?\]\(.*?\)/g, '$1') // 将链接 [text](url) 转换为 text
+                                    .replace(/<[^>]+>/g, ''); // 去除可能的 HTML 标签
+                
+                // 如果文本为空，提示
+                if (!cleanText.trim()) {
+                    alert('没有可朗读的内容');
+                    resetTtsBtn(btn);
+                    return;
+                }
+
+                // 2. 【修改点】调用后端 TTS 接口 (改为 POST 请求)
+                const response = await fetch('/tts', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        text: cleanText
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                
+                if (!data.url) {
+                    throw new Error(data.error || '未获取到音频地址');
+                }
+
+                // 3. 播放音频
+                playAudio(data.url, btn);
+
+            } catch (error) {
+                console.error('TTS Error:', error);
+                alert('朗读失败: ' + error.message);
+                resetTtsBtn(btn);
+            }
+        }
+
+        // 全局音频对象，用于控制停止
+        let currentAudioPlayer = null;
+
+        /**
+         * 播放音频
+         * @param {string} url - OSS 音频地址
+         * @param {HTMLElement} btn - 触发按钮
+         */
+        function playAudio(url, btn) {
+            // 如果有正在播放的音频，先停止
+            stopCurrentAudio();
+
+            currentAudioPlayer = new Audio(url);
+            
+            // 设置播放状态 UI
+            btn.classList.remove('disabled');
+            btn.classList.add('playing');
+            btn.innerHTML = '⏹'; // 停止图标
+
+            // 播放结束或出错时的回调
+            currentAudioPlayer.onended = () => {
+                resetTtsBtn(btn);
+                currentAudioPlayer = null;
+            };
+
+            currentAudioPlayer.onerror = () => {
+                alert('音频播放失败');
+                resetTtsBtn(btn);
+                currentAudioPlayer = null;
+            };
+
+            currentAudioPlayer.play().catch(e => {
+                console.error('Play failed:', e);
+                resetTtsBtn(btn);
+            });
+        }
+
+        /**
+         * 停止当前音频
+         */
+        function stopCurrentAudio() {
+            if (currentAudioPlayer) {
+                currentAudioPlayer.pause();
+                currentAudioPlayer.currentTime = 0;
+                currentAudioPlayer = null;
+            }
+        }
+
+        /**
+         * 重置 TTS 按钮状态
+         * @param {HTMLElement} btn 
+         */
+        function resetTtsBtn(btn) {
+            btn.classList.remove('playing', 'disabled');
+            btn.innerHTML = '🔊';
+        }
+
+    </script>
+</body>
+</html>

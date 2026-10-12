@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI智慧医院 - 首页</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: "Microsoft YaHei", sans-serif;
+        }
+
+        body {
+            min-height: 100vh;
+            background: linear-gradient(135deg, #42b883, #359469);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .welcome-card {
+            background: white;
+            max-width: 600px;
+            width: 100%;
+            padding: 50px 30px;
+            border-radius: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+            text-align: center;
+        }
+
+        .logo {
+            font-size: 60px;
+            margin-bottom: 20px;
+        }
+
+        .title {
+            font-size: 32px;
+            color: #2c3e50;
+            margin-bottom: 15px;
+        }
+
+        .subtitle {
+            font-size: 16px;
+            color: #7f8c8d;
+            line-height: 1.6;
+            margin-bottom: 40px;
+        }
+
+        .enter-btn {
+            display: inline-block;
+            padding: 16px 40px;
+            background: #42b883;
+            color: white;
+            font-size: 18px;
+            border-radius: 50px;
+            text-decoration: none;
+            transition: all 0.3s;
+            border: none;
+            cursor: pointer;
+        }
+
+        .enter-btn:hover {
+            background: #359469;
+            transform: translateY(-3px);
+        }
+
+        .tips {
+            margin-top: 30px;
+            font-size: 14px;
+            color: #95a5a6;
+        }
+    </style>
+</head>
+<body>
+    <div class="welcome-card">
+        <div class="logo">🏥</div>
+        <h1 class="title">AI智慧健康医院</h1>
+        <p class="subtitle">
+            24小时在线智能问诊<br>
+            专业健康咨询、症状分析、用药指导、保健建议<br>
+            温馨提示：咨询结果仅供参考，不能替代线下医院诊断
+        </p>
+        
+        <!-- 点击跳转到聊天页面 (先判断登录态) -->
+        <a href="chat.html" class="enter-btn" id="enter-btn">开始健康咨询</a>
+
+        <div class="tips">
+            点击按钮即可进入AI医生聊天界面
+        </div>
+    </div>
+
+    <script>
+        // 未登录先进登录页, 已登录直接进聊天页
+        document.getElementById('enter-btn').addEventListener('click', function (e) {
+            if (!sessionStorage.getItem('token')) {
+                e.preventDefault();
+                location.href = '/login.html';
+            }
+        });
+    </script>
+</body>
+</html>
