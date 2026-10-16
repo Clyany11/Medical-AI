@@ -39,7 +39,8 @@ async def knowledge_search(
     else:
         return {"context": "", "docs": [], "doc_count": 0, "error": "no manager"}
     try:
-        # manager.search() 是异步调用 Milvus 混合检索 (HNSW 向量索引 + BM25 稀疏检索 + RRF 融合排序),
+        # manager.search() 是异步调用 Milvus 混合检索 (IVF_FLAT 稠密向量 + BM25 稀疏检索 + RRF 融合排序,
+        # 命中子块后按 parent_id 回表取父块正文),
         # 返回按相关性排序的文档列表
         results = await manager.search(query)
         # format_docs() 将检索结果文档列表转换为纯文本字符串,

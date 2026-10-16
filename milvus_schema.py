@@ -1,7 +1,8 @@
 """milvus_schema.py — Milvus Collection Schema 设计与数据写⼊⼯具功能概述:
   1. 定义⽀持图⽚URL的 Milvus Collection Schema
   2. 向量字段 (dense / sparse) 与 image_url 字段完全分离, 不⼲扰语义相似度计算
-  3. 采⽤ HNSW 索引 + BM25 混合检索, 最⼤化检索精度与速度
+  3. 采⽤ IVF_FLAT 索引 + BM25 混合检索, 最⼤化检索精度与速度
+     (Milvus Lite 不支持 HNSW, 稠密向量实际使用 IVF_FLAT)
   4. 提供带 image_url 的⽂档写⼊函数, 供数据⼊库时调⽤
   5. 查询时将 image_url 随召回结果⼀并返回给前端Collection 字段设计:
   │ 字段名           │ 类型              │ 说明                                 │
@@ -13,7 +14,9 @@
   │ source          │ VARCHAR(512)     │ 原始⽂件路径                            │
   │ chunk_index     │ INT64            │ 分块序号                               │
   │ image_url       │ VARCHAR(2048)    │ 图⽚ URL (不参与向量化, 仅存储)          │
-  │ pdf_url         │ VARCHAR(2048)    │ 原始 PDF ⽂件 OSS URL (溯源⽤, 仅存储)   │与 milvus_db.py 的关系:
+  │ pdf_url         │ VARCHAR(2048)    │ 原始 PDF ⽂件 OSS URL (溯源⽤, 仅存储)   │
+  │ parent_id       │ VARCHAR(64)      │ 归属⽗块 doc_id (⼦块回表⽤, 仅存储)      │
+  │ doc_type        │ VARCHAR(16)      │ "parent" / "child" (区分父子记录)        │与 milvus_db.py 的关系:
   - milvus_db.py 负责查询 (search), 本⽂件负责 Schema 定义和数据写⼊
   - 两者共⽤ collection_name = "agent_knowledge"
   - image_url 通过 Document.metadata["image_url"] 传递, 不影响向量检索逻辑使⽤示例:
@@ -59,6 +62,7 @@ MAX_IMAGE_URL_LEN = 2048               # 图⽚ URL 最⼤⻓度
 MAX_PDF_URL_LEN = 2048                 # PDF URL 最⼤⻓度
 MAX_SOURCE_LEN = 512                   # 来源路径最⼤⻓度
 MAX_DOC_ID_LEN = 64                    # doc_id UUID 最⼤⻓度
+MAX_PARENT_ID_LEN = 64                 # parent_id UUID 最⼤⻓度 (与 doc_id 同规格)
 # 写⼊参数默认值 (可⽤ BUILD_BATCH_SIZE / BUILD_BATCH_SLEEP 覆盖)
 DEFAULT_INSERT_BATCH_SIZE = int(os.getenv("BUILD_BATCH_SIZE", 32))
 DEFAULT_INSERT_SLEEP = float(os.getenv("BUILD_BATCH_SLEEP", 0.1))
@@ -74,16 +78,25 @@ class MilvusSchemaManager:
       - dense 向量字段仅存储⽂本语义向量, 与 image_url 完全隔离
       - 查询时通过 output_fields 将 image_url ⼀并返回
     """
-    def __init__(self, uri: str, embedding_client: Optional[Any] = None):
+    def __init__(
+        self,
+        uri: str,
+        embedding_client: Optional[Any] = None,
+        collection_name: str = COLLECTION_NAME,
+        drop_old: bool = False,
+    ):
         """
         初始化 Schema 管理器
         :param uri:              Milvus 连接地址（如 "http://localhost:19530"）
         :param embedding_client: OpenAI 兼容的 embedding 客户端 (⽤于⽂档写⼊时⽣成向量)
+        :param collection_name:  目标 Collection 名 (默认 agent_knowledge; 挂载旧库时需指向其实际集合名)
+        :param drop_old:         是否先删除同名旧 Collection (新增字段/重建时必须置 True, 否则旧 schema 不兼容)
         """
         self.uri = uri
         self.user = milvus_user
         self.passwd = milvus_passwd
-        self.collection_name = COLLECTION_NAME
+        self.collection_name = collection_name
+        self.drop_old = drop_old
         # 嵌⼊模型 (写⼊时使⽤), 未传入客户端时按 .env 配置自动创建
         self.embeddings = OpenAICompatEmbeddings(client=embedding_client or create_embedding_client())
         # Langchain Milvus 实例 (延迟初始化)
@@ -101,12 +114,20 @@ class MilvusSchemaManager:
                 embedding_function=self.embeddings,
                 builtin_function=BM25BuiltInFunction(),
                 vector_field=["dense", "sparse"],
+                # index_params 与 vector_field 按位置一一对应:
+                #   dense  -> IVF_FLAT / IP   (Milvus Lite 下稠密向量索引)
+                #   sparse -> SPARSE_INVERTED_INDEX / BM25
+                # 不传则默认 AUTOINDEX, 会使 Milvus Lite 无法 load 稀疏列
+                index_params=[
+                    {"index_type": "IVF_FLAT", "metric_type": "IP", "params": {"nlist": 128}},
+                    {"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25", "params": {}},
+                ],
                 connection_args=build_connection_args(self.uri, self.user, self.passwd),
                 collection_name=self.collection_name,
                 auto_id=True,
                 # Eventually ⼀致性: 写⼊后不⽴即可查, 但性能最优
                 consistency_level="Eventually",
-                drop_old=False,
+                drop_old=self.drop_old,
             )
         return self._vectorstore
     def insert_documents_with_images(
@@ -124,6 +145,8 @@ class MilvusSchemaManager:
               "chunk_index": 0,                    # 分块序号
               "image_url":   "https://...",        # 图⽚ URL (可为空字符串)
               "pdf_url":     "https://...",        # 原始 PDF OSS URL (可为空字符串)
+              "parent_id":   "…",                  # ⼦块归属的⽗块 doc_id (回表⽤; 空字符串表示⽆⽗块)
+              "doc_type":    "child",              # "parent" 父块 / "child" ⼦块
           }
         image_url 处理逻辑:
           - ⾮空 URL  →  存⼊ Milvus VARCHAR 字段, 查询时随结果返回
@@ -150,6 +173,11 @@ class MilvusSchemaManager:
                 doc.metadata["chunk_index"] = i
             if "source" not in doc.metadata:
                 doc.metadata["source"] = ""
+            # 父子回表字段: 父块 parent_id 为空, 子块 parent_id 指向父块 doc_id
+            if "parent_id" not in doc.metadata:
+                doc.metadata["parent_id"] = ""
+            if "doc_type" not in doc.metadata:
+                doc.metadata["doc_type"] = "child"
             # start_index 由 RecursiveCharacterTextSplitter(add_start_index=True) ⾃动注⼊
             # JSONL 数据没有该字段, 统⼀补 0, 确保所有批次字段⼀致, 避免 Milvus DataNotMatchException
             if "start_index" not in doc.metadata:
@@ -162,6 +190,10 @@ class MilvusSchemaManager:
             if len(doc.metadata["pdf_url"]) > MAX_PDF_URL_LEN:
                 logger.warning(f"pdf_url 超⻓, 已截断: {doc.metadata['pdf_url'][:50]}...")
                 doc.metadata["pdf_url"] = doc.metadata["pdf_url"][:MAX_PDF_URL_LEN]
+            # parent_id 截断保护
+            if len(doc.metadata["parent_id"]) > MAX_PARENT_ID_LEN:
+                logger.warning(f"parent_id 超⻓, 已截断: {doc.metadata['parent_id'][:50]}...")
+                doc.metadata["parent_id"] = doc.metadata["parent_id"][:MAX_PARENT_ID_LEN]
             batch.append(doc)
             if len(batch) >= batch_size:
                 try:
@@ -294,6 +326,6 @@ def extract_image_urls_from_search_results(docs: List[Document]) -> List[Dict[st
             "rank": rank,
             "image_url": image_url,
             "pdf_url": pdf_url,
-            "text_preview": (doc.page_content or "")[:100],
+            "text_preview": (doc.page_content or "")[:500],
         })
     return result

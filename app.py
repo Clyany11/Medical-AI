@@ -38,7 +38,8 @@ import tts_http_demo
 # Feature: 联网搜索 + 医疗领域判断
 from web_search import (
     is_medical_query, needs_web_search, web_search_async,
-    classify_query_intent, NON_MEDICAL_DISCLAIMER, GARBAGE_RESPONSE, GREETING_RESPONSE
+    classify_query_intent, is_ancient_query,
+    NON_MEDICAL_DISCLAIMER, GARBAGE_RESPONSE, GREETING_RESPONSE
 )
 # 会话管理: 从 chat_service 导入数据库操作函数
 from chat_service import get_db, create_session, save_message, check_session_exists
@@ -211,28 +212,15 @@ def detect_intent(query: str) -> str:
     意图识别：判断用户查询是现代医学知识还是古籍知识
 
     识别策略：
-      - 包含古籍关键词 → "ancient_books"
+      - 命中古籍 / 文言关键词 (统一维护在 web_search.ANCIENT_KEYWORDS) → "ancient_books"
       - 默认 → "modern_medicine"
 
     :param query: 用户查询文本
     :return: "ancient_books" 或 "modern_medicine"
     """
-    # 古籍关键词列表 (可根据实际情况扩展)
-    ancient_keywords = [
-        "古籍", "伤寒论", "本草", "黄帝内经", "素问", "灵枢",
-        "针灸", "方剂", "金匮", "温病", "医宗金鉴", "景岳全书",
-        "千金", "外台", "圣济", "普济方", "医学纲目", "古今医统",
-        "冯氏锦囊", "张仲景", "李时珍", "孙思邈", "王叔和",
-        "文言文", "古方", "经方", "时方", "古代", "古人",
-        "《", "》"  # 书名号通常表示引用古籍
-    ]
-
-    # 检查是否包含古籍关键词
-    query_lower = query.lower()
-    for keyword in ancient_keywords:
-        if keyword in query or keyword.lower() in query_lower:
-            logger.info(f"[意图识别] 检测到古籍关键词: {keyword} | 路由到古籍 Collection")
-            return "ancient_books"
+    if is_ancient_query(query):
+        logger.info(f"[意图识别] 检测到古籍关键词 | 路由到古籍 Collection")
+        return "ancient_books"
 
     # 默认路由到现代医学知识
     logger.debug(f"[意图识别] 未检测到古籍关键词 | 路由到现代医学 Collection")
@@ -744,7 +732,37 @@ async def login_page():
     return FileResponse(os.path.join(_APP_DIR, "login.html"))
 
 
-@app.post("/")
+@app.post(
+    "/",
+    openapi_extra={
+        # 该接口用 request: Request 手动解析 body, FastAPI 无法自动推断请求体结构,
+        # 这里手动补一份 requestBody schema, 使 /docs 页面能渲染出输入框 (便于浏览器调试)
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["question"],
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "用户问题 (必填)",
+                                "example": "高血压怎么治疗？",
+                            },
+                            "username": {
+                                "type": "string",
+                                "description": "用户名 (可选, 默认 anonymous)",
+                                "default": "anonymous",
+                                "example": "user_001",
+                            },
+                        },
+                    }
+                }
+            },
+        }
+    },
+)
 async def chatbot(request: Request):
     """
     非流式问答接口 (主接口, 压测调用)
@@ -760,6 +778,9 @@ async def chatbot(request: Request):
         "session_id": "uuid",          # 用于提交👍/👎反馈
         "image_urls": [                # Feature 3: 召回文档关联的图片URL列表
           {"rank": 0, "image_url": "https://...", "pdf_url": "https://...", "text_preview": "..."}
+        ],
+        "chunks": [                    # 召回文档原文片段 (父块正文/来源/序号)
+          {"rank": 0, "text": "...", "source": "...", "chunk_index": 0, "doc_id": "..."}
         ]
       }
     """
@@ -793,12 +814,26 @@ async def chatbot(request: Request):
         else:
             image_urls = []
 
+        # 返回召回文档的原文片段 (chunk), 供前端展示答案依据来源
+        # 注意: 方案 B 父子回表后, 这里返回的是父块正文 (最长 2000 字)
+        chunks = [
+            {
+                "rank":        rank,
+                "text":        doc.page_content or "",
+                "source":      doc.metadata.get("source", ""),
+                "chunk_index": doc.metadata.get("chunk_index"),
+                "doc_id":      doc.metadata.get("doc_id", ""),
+            }
+            for rank, doc in enumerate(retrieval_docs or [])
+        ]
+
         return {
             "response":   response,
             "status":     200,
             "time":       time_str,
             "session_id": session_id,   # 返回给前端, 用于提交👍/👎反馈
             "image_urls": image_urls,   # Feature 3: 图片URL列表 (非医疗领域为空列表)
+            "chunks":     chunks,       # 召回文档原文片段 (含全文/来源/序号)
         }
 
     except Exception as e:

@@ -27,7 +27,7 @@
 | 能力 | 说明 |
 | --- | --- |
 | **Multi-Agent 编排** | RouterAgent(规则路由,零 LLM 调用) → Skills(工具) → MedicalAgent(RAG 生成) → ReflectionAgent(四维度质量反思与自我修正) |
-| **RAG 混合检索** | Milvus 稠密向量(HNSW/IVF_FLAT)+ BM25 稀疏检索 + RRF 融合排序 + Rerank 精排 |
+| **RAG 混合检索** | Milvus 稠密向量(IVF_FLAT)+ BM25 稀疏检索 + RRF 融合排序 + Rerank 精排 + 父子回表(命中子块取父块) |
 | **双知识库** | 现代医学文献库 + 中医古籍库,按意图自动切换检索集合 |
 | **Redis 三层缓存防护** | 防击穿(分布式锁 + 双重检查)、防穿透(`<EMPTY>` 占位)、防雪崩(±10% TTL 抖动) |
 | **三层记忆机制** | 短期记忆(Redis List / LRU 降级)、长期记忆(Redis Hash)、语义记忆(Milvus) |
@@ -350,7 +350,7 @@ web_search > medical_rag > chitchat
 
 ### 2. 混合检索(RAG)
 
-- 稠密向量:Milvus(HNSW / IVF_FLAT 索引)
+- 稠密向量:Milvus(IVF_FLAT 索引;Milvus Lite 不支持 HNSW)
 - 稀疏检索:BM25
 - 融合排序:RRF(Reciprocal Rank Fusion)
 - 精排:Rerank

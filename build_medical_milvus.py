@@ -10,14 +10,18 @@ build_milvus_db.py — Milvus 数据库建库脚本
      - 子文件夹名 + ".pdf" 作为 source 字段
      - 对应的原始 PDF 文件上传到阿里云 OSS pdf_documents/ 文件夹, pdf_url 写入 Milvus
      - 按 parent 块（chunk_size=2000）→ child 块（chunk_size=400）两级切分
+     - 父子回表: 父块与子块都写入 Milvus (doc_type 区分), 子块用 parent_id 指向父块;
+       检索命中子块后回表取父块正文送 LLM
      - image_url 为空字符串, pdf_url 为 OSS 上的原始 PDF 访问地址
 运行方式:
-  python build_milvus_db.py                    # 全量建库 (jsonl + pdf)
+  python build_milvus_db.py                    # 全量建库 (pdf + jsonl + txt)
   python build_milvus_db.py --only-jsonl       # 仅处理 jsonl
   python build_milvus_db.py --only-pdf         # 仅处理 pdf
+  python build_milvus_db.py --only-txt         # 仅处理 txt
+  python build_milvus_db.py --rebuild          # 先删除同名旧集合再重建 (新增字段后必须加此参数)
   python build_milvus_db.py --skip-image       # 跳过图片生成 (jsonl 数据 image_url 为空)
 注意：
-  - Milvus 采用 Standalone 模式, URI = http://localhost:19530
+  - Milvus 采用本地文件模式 (Milvus Lite), 连接地址读 MILVUS_ENDPOINT; 目标集合名读 MILVUS_COLLECTION
   - 所有外部依赖 (EMBEDDING_API_KEY, ARK_API_KEY[可选], Alibaba_ACCESS_KEY_ID 等) 从 .env 读取
   - 本脚本不修改任何已有代码文件, 仅复用已有模块
 """
@@ -57,7 +61,10 @@ logging.basicConfig(
 logger = logging.getLogger("BuildMilvusDB")
 
 # ===================== 全局配置 =====================
-MILVUS_URI = os.getenv("MILVUS_URI", "http://localhost:19530")
+# 与运行时保持一致: 本地文件模式读 MILVUS_ENDPOINT, 目标集合名读 MILVUS_COLLECTION
+# 变量名不用 MILVUS_URI, 因为 pymilvus 会读取同名环境变量并强制要求 http(s) 格式
+MILVUS_URI = os.getenv("MILVUS_ENDPOINT") or os.getenv("MILVUS_URI", "http://localhost:19530")
+MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", COLLECTION_NAME)
 # 仅文生图需要 Ark (可选); embedding 走 OpenAI 兼容接口
 ARK_API_KEY = os.getenv("ARK_API_KEY", "")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
@@ -277,11 +284,14 @@ def load_txt_docs(txt_path: str, source: str) -> List[Document]:
 
 def split_pdf_docs(docs: List[Document], pdf_url: str = "") -> List[Document]:
     """
-    对 PDF 原始文档进行两级切分 (parent 2000 → child 400)
-    image_url 为空, pdf_url 由调用方传入, 所有 child 块共享同一 pdf_url
+    对 PDF 原始文档进行两级切分 (parent 2000 → child 400), 并保留父块以支持"父子回表".
+    返回的 Document 列表同时包含:
+      - 父块 (doc_type="parent"): text 为父块正文, 自身 doc_id 作为子块 parent_id 的取值
+      - 子块 (doc_type="child") : text 为子块正文, parent_id 指向其所属父块 doc_id
+    image_url 为空, pdf_url 由调用方传入, 父子块共享同一 pdf_url
     :param docs:    load_txt_docs 返回的原始 Document 列表
-    :param pdf_url: 原始 PDF 文件的 OSS URL (所有 child 块共享)
-    :return: child Document 列表
+    :param pdf_url: 原始 PDF 文件的 OSS URL (所有块共享)
+    :return: 父块 + 子块 的 Document 列表
     """
     parent_splitter = RecursiveCharacterTextSplitter(
         chunk_size=PARENT_CHUNK_SIZE,
@@ -300,20 +310,42 @@ def split_pdf_docs(docs: List[Document], pdf_url: str = "") -> List[Document]:
     parent_chunks = parent_splitter.split_documents(docs)
     logger.info(f"  parent 切分: {len(docs)} 条原始文档 → {len(parent_chunks)} 个 parent 块")
 
+    parent_docs: List[Document] = []
     child_docs: List[Document] = []
-    chunk_idx = 0
-    for parent in parent_chunks:
-        children = child_splitter.split_documents([parent])
-        for child in children:
+    child_idx = 0
+    for parent_idx, parent in enumerate(parent_chunks):
+        # 父块: 单独成一条记录, doc_type="parent", 无上级 (parent_id 为空)
+        parent_id = str(uuid.uuid4())
+        source = parent.metadata.get("source", "")
+        parent_docs.append(Document(
+            page_content=parent.page_content,
+            metadata={
+                "doc_id":      parent_id,
+                "parent_id":   "",
+                "doc_type":    "parent",
+                "source":      source,
+                "image_url":   "",
+                "pdf_url":     pdf_url,
+                "chunk_index": parent_idx,
+                "start_index": parent.metadata.get("start_index", 0),
+            },
+        ))
+        # 子块: doc_type="child", parent_id 指向父块
+        for child in child_splitter.split_documents([parent]):
             child.metadata["doc_id"] = str(uuid.uuid4())
-            child.metadata["source"] = parent.metadata.get("source", "")
+            child.metadata["parent_id"] = parent_id
+            child.metadata["doc_type"] = "child"
+            child.metadata["source"] = source
             child.metadata["image_url"] = ""
             child.metadata["pdf_url"] = pdf_url
-            child.metadata["chunk_index"] = chunk_idx
+            child.metadata["chunk_index"] = child_idx
             child_docs.append(child)
-            chunk_idx += 1
-    logger.info(f"  child 切分完成: {len(parent_chunks)} 个 parent 块 → {len(child_docs)} 个 child 块")
-    return child_docs
+            child_idx += 1
+    logger.info(
+        f"  child 切分完成: {len(parent_chunks)} 个 parent 块 → "
+        f"{len(parent_docs)} 个 parent 记录 + {len(child_docs)} 个 child 块"
+    )
+    return parent_docs + child_docs
 
 
 def process_pdf_output(schema_manager: MilvusSchemaManager) -> int:
@@ -377,18 +409,18 @@ def process_pdf_output(schema_manager: MilvusSchemaManager) -> int:
             raw_docs = load_txt_docs(str(txt_path), source=source)
             if not raw_docs:
                 continue
-            # 4: 两级切分, 传入 pdf_url (所有 child 块共享)
-            child_docs = split_pdf_docs(raw_docs, pdf_url=pdf_url)
+            # 4: 两级切分 (含父块), 传入 pdf_url (所有块共享)
+            docs_to_insert = split_pdf_docs(raw_docs, pdf_url=pdf_url)
             # 5: 写入 Milvus
             written = schema_manager.insert_documents_with_images(
-                child_docs,
+                docs_to_insert,
                 batch_size=BATCH_SIZE,
                 sleep_between_batches=BATCH_SLEEP,
             )
             total_written += written
-            logger.info(f"  已写入 {written} 个 child chunk")
+            logger.info(f"  已写入 {written} 个 parent/child 块")
 
-    logger.info(f"=== PDF 数据写入完成, 共 {total_written} 个 child chunk ===")
+    logger.info(f"=== PDF 数据写入完成, 共 {total_written} 个 parent/child 块 ===")
     return total_written
 
 
@@ -431,18 +463,18 @@ def process_medical_texts(schema_manager: MilvusSchemaManager) -> int:
         raw_docs = load_txt_docs(str(txt_path), source=source)
         if not raw_docs:
             continue
-        # 3: 两级切分, 传入 txt_url (存入 pdf_url 字段, 所有 child 块共享)
-        child_docs = split_pdf_docs(raw_docs, pdf_url=txt_url)
+        # 3: 两级切分 (含父块), 传入 txt_url (存入 pdf_url 字段, 所有块共享)
+        docs_to_insert = split_pdf_docs(raw_docs, pdf_url=txt_url)
         # 4: 增量写入 Milvus
         written = schema_manager.insert_documents_with_images(
-            child_docs,
+            docs_to_insert,
             batch_size=BATCH_SIZE,
             sleep_between_batches=BATCH_SLEEP,
         )
         total_written += written
-        logger.info(f"  已写入 {written} 个 child chunk")
+        logger.info(f"  已写入 {written} 个 parent/child 块")
 
-    logger.info(f"=== medical_texts 数据写入完成, 共 {total_written} 个 child chunk ===")
+    logger.info(f"=== medical_texts 数据写入完成, 共 {total_written} 个 parent/child 块 ===")
     return total_written
 
 
@@ -451,11 +483,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Milvus 建库脚本")
     parser.add_argument("--only-jsonl", action="store_true", help="仅处理 data.jsonl")
     parser.add_argument("--only-pdf",   action="store_true", help="仅处理 pdf_output")
-    parser.add_argument("--only-txt", action="store_true", help="仅处理medical_texts")
+    parser.add_argument("--only-txt", action="store_true", help="仅处理 txt (medical_texts/Ancient-Books)")
     parser.add_argument(
         "--skip-image",
         action="store_true",
         help="跳过图片生成 (jsonl 数据 image_url 置空, 加快建库速度)",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="先删除同名旧集合再重建 (新增 parent_id/doc_type 等字段后必须加此参数)",
     )
     return parser.parse_args()
 
@@ -464,11 +501,13 @@ def main():
     args = parse_args()
     logger.info("=" * 60)
     logger.info("Milvus 建库脚本启动")
-    logger.info(f"  MILVUS_URI  : {MILVUS_URI}")
-    logger.info(f"  only-jsonl  : {args.only_jsonl}")
-    logger.info(f"  only-pdf    : {args.only_pdf}")
-    logger.info(f"  only-txt    : {args.only_txt}")
-    logger.info(f"  skip-image  : {args.skip_image}")
+    logger.info(f"  MILVUS_URI   : {MILVUS_URI}")
+    logger.info(f"  COLLECTION   : {MILVUS_COLLECTION}")
+    logger.info(f"  only-jsonl   : {args.only_jsonl}")
+    logger.info(f"  only-pdf     : {args.only_pdf}")
+    logger.info(f"  only-txt     : {args.only_txt}")
+    logger.info(f"  skip-image   : {args.skip_image}")
+    logger.info(f"  rebuild      : {args.rebuild}")
     logger.info("=" * 60)
 
     # 初始化 Embedding 客户端 (OpenAI 兼容)
@@ -487,26 +526,36 @@ def main():
             ark_client = Ark(api_key=ARK_API_KEY)
 
     # 初始化 MilvusSchemaManager (复用已有模块, 传入 OpenAI 兼容 embedding 客户端)
-    schema_manager = MilvusSchemaManager(uri=MILVUS_URI, embedding_client=embedding_client)
+    # collection_name 与运行时保持一致; --rebuild 时先删除旧集合 (旧 schema 无 parent_id/doc_type)
+    schema_manager = MilvusSchemaManager(
+        uri=MILVUS_URI,
+        embedding_client=embedding_client,
+        collection_name=MILVUS_COLLECTION,
+        drop_old=args.rebuild,
+    )
+
+    # 各数据源是否处理: 指定了 --only-xxx 时只处理对应源, 否则全部处理
+    run_pdf = args.only_pdf or not (args.only_jsonl or args.only_txt)
+    run_jsonl = args.only_jsonl or not (args.only_pdf or args.only_txt)
+    run_txt = args.only_txt or not (args.only_jsonl or args.only_pdf)
 
     total = 0
 
     # Part 1: 处理 PDF
-    if not args.only_jsonl:
+    if run_pdf:
         total += process_pdf_output(schema_manager=schema_manager)
 
     # Part 2: 处理 JSONL
-    if not args.only_pdf:
+    if run_jsonl:
         total += process_jsonl(
             ark_client=ark_client,
             schema_manager=schema_manager,
             skip_image=args.skip_image,
         )
 
-    # Part 3: 处理txt
-    if not args.only_jsonl and not args.only_pdf:
+    # Part 3: 处理 txt
+    if run_txt:
         total += process_medical_texts(schema_manager=schema_manager)
-    total += process_medical_texts(schema_manager=schema_manager)
 
     logger.info("=" * 60)
     logger.info(f"建库完成！本次共写入 {total} 条数据到 Milvus")

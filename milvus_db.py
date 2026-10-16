@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import time
 import httpx
@@ -18,7 +19,8 @@ MILVUS_PERF_CONFIG = {
     "collection_name": os.getenv("MILVUS_COLLECTION", "agent_knowledge"),
     "consistency_level": "Bounded",
     # 稠密索引检索参数 (必须与实际建索引时的类型一致, 否则参数被忽略、退回默认值)
-    "hnsw_search_params": {
+    # 注意: Milvus Lite 不支持 HNSW, 实际建的是 IVF_FLAT, 故按 IVF_FLAT 传参
+    "dense_search_params": {
         "metric_type": "IP",
         "index_type": "IVF_FLAT",
         "params": {"nprobe": 16}
@@ -36,7 +38,7 @@ ANCIENT_BOOKS_CONFIG = {
     "default_top_k": 30,
     "collection_name": os.getenv("MILVUS_ANCIENT_COLLECTION", "ancient_books_knowledge"),
     "consistency_level": "Eventually",
-    "hnsw_search_params": {
+    "dense_search_params": {
         "metric_type": "IP",
         "index_type": "IVF_FLAT",
         "params": {"nprobe": 16}
@@ -168,7 +170,7 @@ class MilvusClientWrapper:
     def _cache_search_params(self):
         """缓存检索参数, 减少运⾏时对象创建开销"""
         self._search_params_cache = [
-            self.config["hnsw_search_params"],
+            self.config["dense_search_params"],
             self.config["bm25_search_params"]
         ]
         logger.debug(f"Milvus检索参数已缓存! (集合: {self.collection_name})")
@@ -242,6 +244,67 @@ class MilvusClientWrapper:
                 f"耗时: {cost}s | 错误: {str(e)}"
             )
             return docs[:top_n]
+    async def _fetch_parents(self, docs: List[Document]) -> List[Document]:
+        """
+        父子回表: 用命中的 child 的 parent_id 去同一 Collection 里取回父块正文.
+
+        建库时父块与子块都写入了 Collection (doc_type 区分):
+          - 子块 doc_type="child", parent_id 指向所属父块 doc_id
+          - 父块 doc_type="parent", doc_id 即子块要回表的 parent_id
+        检索只召回子块 (见 search 里的 expr 过滤), 命中后在此按 parent_id 回表取父块正文,
+        多个子块命中同一父块时按首次出现顺序去重 (保留最优名次).
+        JSONL 等无父块的文档 (parent_id 为空) 原样保留; 回表失败的子块降级保留其自身内容.
+        """
+        if not docs:
+            return []
+        # 1: 收集需要回表的 parent_id (去重, 保持顺序)
+        parent_ids: List[str] = []
+        for d in docs:
+            pid = d.metadata.get("parent_id") or ""
+            if pid and pid not in parent_ids:
+                parent_ids.append(pid)
+        if not parent_ids:
+            return docs
+        # 2: 按 doc_id 批量查询父块 (doc_id in [...])
+        row_map: Dict[str, Dict[str, Any]] = {}
+        try:
+            expr = f"doc_id in {json.dumps(parent_ids, ensure_ascii=False)}"
+            rows = self.vectorstore.col.query(
+                expr=expr,
+                output_fields=["doc_id", "text", "source", "image_url", "pdf_url", "chunk_index"],
+            )
+            row_map = {r["doc_id"]: r for r in rows}
+        except Exception as e:
+            logger.warning(f"父子回表查询失败, 降级返回子块内容 | 错误: {str(e)}")
+            return docs
+        # 3: 按原召回顺序, 用父块正文替换子块, 同一父块只保留一次
+        result: List[Document] = []
+        seen_parents = set()
+        for d in docs:
+            pid = d.metadata.get("parent_id") or ""
+            if not pid:
+                result.append(d)          # 无父块 (如 JSONL), 原样返回
+                continue
+            if pid in seen_parents:
+                continue                  # 该父块已输出过, 去重
+            row = row_map.get(pid)
+            if not row:
+                result.append(d)          # 回表未命中, 降级保留子块
+                continue
+            seen_parents.add(pid)
+            result.append(Document(
+                page_content=row.get("text", "") or d.page_content,
+                metadata={
+                    "doc_id":      row.get("doc_id", ""),
+                    "parent_id":   pid,
+                    "doc_type":    "parent",
+                    "source":      row.get("source", ""),
+                    "image_url":   row.get("image_url", ""),
+                    "pdf_url":     row.get("pdf_url", ""),
+                    "chunk_index": d.metadata.get("chunk_index"),
+                },
+            ))
+        return result
     async def search(self, query: str, k: Optional[int] = None) -> List[Document]:
         """
         ⾼性能异步检索 (混合检索 + Rerank 精排)
@@ -263,7 +326,7 @@ class MilvusClientWrapper:
         # 粗召回条数: 启用 rerank 时多召回候选 (candidate_k) 交给精排挑选, 否则等于 final_k
         recall_k = max(final_k, RERANK_CONFIG["candidate_k"]) if rerank_on else final_k
         search_params = self._search_params_cache or [
-            self.config["hnsw_search_params"],
+            self.config["dense_search_params"],
             self.config["bm25_search_params"]
         ]
         # 每个向量分支 (dense / sparse) 的预取条数.
@@ -277,17 +340,26 @@ class MilvusClientWrapper:
         logger.debug(f"开始 Milvus 检索 | query: {query[:20]}... | 粗召回: {recall_k} | 最终: {final_k}")
         try:
             # 核⼼检索逻辑 (粗召回候选池)
+            # 方案B(父子回表): 只让 child 块参与匹配 (expr 过滤 doc_type), 父块不参与;
+            # 命中子块后再在下方用 parent_id 回表取父块正文送 LLM (见 _fetch_parents)
             docs = await self.vectorstore.asimilarity_search(
                 query=query,
                 k=recall_k,
                 fetch_k=fetch_k,
+                expr="doc_type == 'child'",
                 ranker_type=self.config["ranker_type"],
                 ranker_params=self.config["ranker_params"],
                 search_params=search_params
             )
+            # 兼容保护: 万一底层未应用 doc_type 过滤, 这里再剔除父块
+            # (老库无 doc_type 字段时按 child 处理, 不影响原有行为)
+            docs = [d for d in docs if d.metadata.get("doc_type", "child") != "parent"]
             # 4: Rerank 精排 (粗召回 → 精排取 top_n; 未启用或失败时自动降级为原始顺序)
+            #    注意: 精排对子块打分 (细粒度命中), 回表取父块是为了给 LLM 更完整上下文
             if rerank_on:
                 docs = await self._rerank(query, docs, final_k)
+            # 4.5: 父子回表 — 用命中子块的 parent_id 取回父块正文 (同一父块自动去重)
+            docs = await self._fetch_parents(docs)
             # 5. 耗时统计 (压测关键指标)
             search_cost = round(time.time() - start_time, 3)
             logger.info(

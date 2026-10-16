@@ -59,6 +59,7 @@ class RouterAgent:
         self._classify_fn = None        # → web_search.classify_query_intent
         self._medical_fn = None         # → web_search.is_medical_query
         self._web_search_fn = None      # → web_search.needs_web_search
+        self._ancient_fn = None         # → web_search.is_ancient_query
         self._detect_intent_fn = None   # → self._detect_intent_inline (内联实现)
 
     def _ensure_imports(self):
@@ -76,10 +77,12 @@ class RouterAgent:
                 classify_query_intent,
                 is_medical_query,
                 needs_web_search,
+                is_ancient_query,
             )
             self._classify_fn = classify_query_intent
             self._medical_fn = is_medical_query
             self._web_search_fn = needs_web_search
+            self._ancient_fn = is_ancient_query
 
     def _ensure_intent_import(self):
         """延迟导入 app 模块的 detect_intent (避免循环)"""
@@ -92,29 +95,15 @@ class RouterAgent:
             # 功能完全等价 (关键词匹配), 但彻底切断了与 app.py 的导入依赖。
             self._detect_intent_fn = self._detect_intent_inline
 
-    @staticmethod
-    def _detect_intent_inline(query: str) -> str:
-        """意图识别: 现代医学 vs 古籍 (内联版, 避免从 app.py 导入)"""
-        # 古籍关键词列表: 涵盖经典中医典籍名, 古代医家姓名, 古文标志词
-        # 这些关键词用于判断用户是否在询问中医古籍相关内容
-        # 如果匹配到, 路由到 ancient_books collection (古籍向量库)
-        # 否则默认路由到 modern_medicine collection (现代医学向量库)
-        ancient_keywords = [
-            "古籍", "伤寒论", "本草", "黄帝内经", "素问", "灵枢",
-            "针灸", "方剂", "金匮", "温病", "医宗金鉴", "景岳全书",
-            "千金", "外台", "圣济", "普济方", "医学纲目", "古今医统",
-            "冯氏锦囊", "张仲景", "李时珍", "孙思邈", "王叔和",
-            "文言文", "古方", "经方", "时方", "古代", "古人",
-            "《", "》"
-        ]
-        # 同时检查原始 query 和小写版本 query_lower:
-        # - 原始 query: 用于匹配中文关键词 (中文无大小写区分, 但保持原样匹配)
-        # - query_lower: 用于匹配可能包含英文的关键词 (如书名英文缩写等)
-        # 双重检查确保无论用户输入大小写如何, 都能正确匹配
-        query_lower = query.lower()
-        for keyword in ancient_keywords:
-            if keyword in query or keyword.lower() in query_lower:
-                return "ancient_books"
+    def _detect_intent_inline(self, query: str) -> str:
+        """意图识别: 现代医学 vs 古籍 (内联版, 避免从 app.py 导入)
+
+        古籍 / 文言关键词统一维护在 web_search.ANCIENT_KEYWORDS, 通过
+        self._ancient_fn (即 is_ancient_query) 判断: 命中则走古籍集合,
+        否则走现代医学集合. 这样古籍词表只在一处维护, 避免多处漂移.
+        """
+        if self._ancient_fn and self._ancient_fn(query):
+            return "ancient_books"
         return "modern_medicine"
 
     async def route(self, query: str) -> RouteDecision:

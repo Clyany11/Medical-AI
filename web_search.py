@@ -92,6 +92,24 @@ MEDICAL_KEYWORDS = [
     "饮食", "营养", "维生素", "蛋白质", "减肥", "运动", "睡眠", "保健",
 ]
 
+# 中医古籍 / 文言关键词 (古籍名 / 古医家 / 文言表述)
+# 命中即视为"中医古籍类"意图: 既算医疗问题(需走 RAG 检索), 又用于分流到古籍集合.
+# 注意: 除古籍名外, 还必须覆盖文言表述(如 正气/邪气/医道/典籍), 否则《黄帝内经》
+#       的名句("正气存内, 邪不可干")会因不含任何现代医学词而漏判为闲聊.
+ANCIENT_KEYWORDS = [
+    # 古籍名
+    "古籍", "伤寒论", "本草", "本草纲目", "黄帝内经", "素问", "灵枢", "脉经",
+    "金匮", "金匮要略", "温病", "医宗金鉴", "景岳全书", "千金", "外台",
+    "圣济", "普济方", "医学纲目", "古今医统", "冯氏锦囊",
+    # 古医家
+    "张仲景", "李时珍", "孙思邈", "王叔和",
+    # 文言 / 中医表述
+    "文言文", "古方", "经方", "时方", "古代", "古人", "医道", "典籍", "医书",
+    "正气", "邪气", "阴阳", "五行", "脏腑", "辨证", "经络", "气血",
+    # 书名号通常表示引用古籍
+    "《", "》",
+]
+
 # 时效性关键词 (需要联网搜索才能回答的问题)
 WEB_SEARCH_KEYWORDS = [
     "天气", "气温", "空气质量", "pm2.5", "新闻", "实时", "股价", "股票",
@@ -144,8 +162,24 @@ def _is_greeting(query: str) -> bool:
     return False
 
 
+def is_ancient_query(query: str) -> bool:
+    """中医古籍 / 文言类意图判断: 命中古籍名或文言表述即为古籍问题"""
+    text = (query or "").strip()
+    if not text:
+        return False
+    lower = _normalize(text)
+    for keyword in ANCIENT_KEYWORDS:
+        if keyword in text or keyword.lower() in lower:
+            return True
+    return False
+
+
 def is_medical_query(query: str) -> bool:
-    """医疗领域深度匹配: 命中任一医疗关键词即认为属于医疗领域"""
+    """医疗领域深度匹配: 命中任一医疗关键词即认为属于医疗领域
+
+    中医古籍 / 文言表述(如 "正气存内, 邪不可干")同样视为医疗问题,
+    以保证其能进入 RAG 链路, 再由 RouterAgent 分流到古籍集合.
+    """
     text = (query or "").strip()
     if not text:
         return False
@@ -153,7 +187,8 @@ def is_medical_query(query: str) -> bool:
     for keyword in MEDICAL_KEYWORDS:
         if keyword in text or keyword in lower:
             return True
-    return False
+    # 古籍 / 文言表述同样算医疗问题
+    return is_ancient_query(query)
 
 
 def needs_web_search(query: str) -> bool:
