@@ -50,6 +50,8 @@ from auth import router as auth_router, resolve_user_from_authorization
 # Multi-Agent 架构模块
 from agents.orchestrator import AgentOrchestrator
 from memory.manager import MemoryManager
+# 问答缓存策略分类器 (纯规则)
+from cache_strategy import decide_cache_query, INDEPENDENT_STREAM_PREFIX, INDEPENDENT_CACHE_PREFIX
 
 
 # 配置日志：FileHandler 直接写入 app.log, 不依赖 shell 重定向
@@ -347,18 +349,14 @@ async def stream_doubao_generator(query: str, think_type: str = "disabled", sess
     """
     流式生成器 (Multi-Agent 版本 + Redis 缓存)
 
-    缓存策略 (三层防护):
-      - 缓存命中: 将缓存内容逐字符模拟流式 yield, TTFT 降至 <10ms
+    缓存策略 (问题类型判定 + 三层防护):
+      - INDEPENDENT 通用知识问题: 用规范化 query 生成稳定 Key (前缀 llm:stream:v2:),
+        不含历史摘要 / 用户标识, 可跨无关历史复用; 命中则逐字符模拟流式 yield
+      - CONTEXTUAL / SENSITIVE_OR_UNCERTAIN: 跳过普通问答缓存读写, 直接走 Multi-Agent 流程
       - 缓存未命中: Multi-Agent 编排器流式输出, 完成后异步写入缓存
       - 防击穿: 分布式锁 + 双重检查
       - 防穿透: <EMPTY> 占位符
       - 防雪崩: set_answer() 内置 ±10% TTL 抖动
-
-    多轮记忆 (新增):
-      - session_id 非空且该会话已有历史时, 缓存 Key 会附加历史摘要 (cache_query),
-        实现"按会话上下文隔离缓存", 避免同一句问题在不同上下文里串话
-      - 无 session_id / 无历史 (首轮、压测、语音) 时 cache_query == query,
-        缓存 Key 与升级前逐字节一致, TTFT 与命中行为完全不受影响
 
     Multi-Agent 流程:
       RouterAgent (意图路由, <1ms) → Skills (Milvus/Web) → MedicalAgent (流式 LLM)
@@ -367,17 +365,32 @@ async def stream_doubao_generator(query: str, think_type: str = "disabled", sess
     t0 = time.time()
     logger.info(f"[TTFT][Multi-Agent] 流式请求开始 | query: {query[:30]}...")
 
-    # 计算缓存 Key 用的查询文本: 仅当会话已有历史时附加 12 位历史摘要后缀
-    # 无历史时 digest 为空 → cache_query == query → 缓存 Key 与升级前完全一致
-    # 已登录用户额外附加 user 段: 长期记忆会改变生成结果, 必须按用户隔离缓存,
-    # 否则不同用户问同一句(且都无历史)会互相命中对方被个性化过的答案.
-    history_digest = memory_manager.get_context_digest(session_id) if session_id else ""
-    key_parts = [query]
-    if history_digest:
-        key_parts.append(f"ctx:{history_digest}")
-    if user_id and user_id != "anonymous":
-        key_parts.append(f"user:{user_id}")
-    cache_query = "\x00".join(key_parts)
+    # ── 0. 缓存策略判定 (纯规则, 零 LLM / 零额外 I/O) ──
+    # INDEPENDENT            → 用规范化 query 生成稳定 Key (不含 history_digest / user), 可跨无关历史复用
+    # CONTEXTUAL / SENSITIVE → 跳过普通问答缓存读写, 直接走 Multi-Agent 流程
+    history = memory_manager.get_context(session_id, last_n=5) if session_id else ""
+    cache_strategy, cache_query = decide_cache_query(query, history)
+
+    if not cache_query:
+        # 上下文相关 / 个体化或不确定: 跳过普通问答缓存的读与写
+        logger.info(
+            f"[TTFT] 跳过问答缓存 | strategy={cache_strategy.value} | query: {query[:30]}..."
+        )
+        first_token_received = False
+        try:
+            async for delta in agent_orchestrator.execute_stream(
+                query=query, think_type=think_type,
+                session_id=session_id, user_id=user_id
+            ):
+                if not first_token_received:
+                    ttft = round(time.time() - t0, 3)
+                    logger.info(f"[TTFT][Multi-Agent] 🎯 首字符输出 | TTFT: {ttft}s (无缓存)")
+                    first_token_received = True
+                yield delta
+        except Exception as e:
+            logger.error(f"[TTFT][Multi-Agent] 流式生成失败: {e}")
+            yield f"Error: {str(e)}"
+        return
 
     # 缓存命中时不会进入 Orchestrator, 也就不会写短期记忆; 在此显式补记,
     # 否则多轮记忆会在"该轮命中缓存"时断链 (表现为时好时坏、偶尔记不住)
@@ -387,7 +400,7 @@ async def stream_doubao_generator(query: str, think_type: str = "disabled", sess
             memory_manager.add_turn(session_id, "assistant", answer[:200])
 
     # ── 1. 查流式缓存 (命中则模拟流式输出, TTFT < 10ms) ──
-    cached = await redis_manager.get_answer_async_with_prefix(cache_query, prefix="llm:stream:")
+    cached = await redis_manager.get_answer_async_with_prefix(cache_query, prefix=INDEPENDENT_STREAM_PREFIX)
     if cached:
         logger.info(f"[TTFT] 流式缓存命中 ✅ | query: {query[:30]}...")
         _record_turn(cached)
@@ -404,7 +417,7 @@ async def stream_doubao_generator(query: str, think_type: str = "disabled", sess
     if lock_token:
         try:
             # 双重检查
-            cached_retry = await redis_manager.get_answer_async_with_prefix(cache_query, prefix="llm:stream:")
+            cached_retry = await redis_manager.get_answer_async_with_prefix(cache_query, prefix=INDEPENDENT_STREAM_PREFIX)
             if cached_retry:
                 logger.info(f"[TTFT] 流式缓存命中 (Double Check) ✅ | query: {query[:30]}...")
                 _record_turn(cached_retry)
@@ -441,7 +454,7 @@ async def stream_doubao_generator(query: str, think_type: str = "disabled", sess
                     asyncio.create_task(
                         asyncio.to_thread(
                             redis_manager.set_answer_with_prefix,
-                            cache_query, full_response, prefix="llm:stream:"
+                            cache_query, full_response, prefix=INDEPENDENT_STREAM_PREFIX
                         )
                     )
                 else:
@@ -449,7 +462,7 @@ async def stream_doubao_generator(query: str, think_type: str = "disabled", sess
                     asyncio.create_task(
                         asyncio.to_thread(
                             redis_manager.client.setex,
-                            redis_manager._generate_key(cache_query, prefix="llm:stream:"), 60, "<EMPTY>"
+                            redis_manager._generate_key(cache_query, prefix=INDEPENDENT_STREAM_PREFIX), 60, "<EMPTY>"
                         )
                     )
 
@@ -464,7 +477,7 @@ async def stream_doubao_generator(query: str, think_type: str = "disabled", sess
     else:
         # 获取锁失败, 等待后尝试读缓存
         await asyncio.sleep(0.01)
-        cached_fallback = await redis_manager.get_answer_async_with_prefix(cache_query, prefix="llm:stream:")
+        cached_fallback = await redis_manager.get_answer_async_with_prefix(cache_query, prefix=INDEPENDENT_STREAM_PREFIX)
         if cached_fallback:
             _record_turn(cached_fallback)
             chunk_size = 20
@@ -585,21 +598,48 @@ async def get_or_compute_async(
     question: str, session_id: str, user_id: str
 ):
     """
-    异步版缓存逻辑(优化版本,防击穿/防穿透/防雪崩)
+    异步版缓存逻辑(优化版本,防击穿/防穿透/防雪崩) + 缓存策略分类
 
     优化点：
-      1. 使用 redis_manager.get_answer_async() 减少线程池开销
+      1. 使用 redis_manager.get_answer_async_with_prefix() 减少线程池开销
       2. 缓存命中时延迟从 ~30ms 降至 ~10ms
       3. 增强日志监控，记录缓存命中率
 
     返回: (answer: str, retrieval_docs: List[Document])
       - 缓存命中时 retrieval_docs 为空列表 (无 Milvus 召回, image_urls 也为空)
       - 缓存未命中时 retrieval_docs 为完整召回文档列表 (含 image_url 字段)
+
+    缓存策略: 非流式接口为无状态单轮, 无历史上下文. 统一套用 classify_cache_strategy:
+      - INDEPENDENT            → 用规范化 question 生成稳定 Key (llm:cache:v2:), 正常读写缓存
+      - CONTEXTUAL / SENSITIVE → 跳过缓存读写, 直接执行 RAG/Agent 流程
     """
     a3 = time.time()
 
+    # 0: 缓存策略判定 (无历史 → 上下文相关 / 个体化 / 不确定 均跳过缓存)
+    cache_strategy, cache_question = decide_cache_query(question, "")
+
+    if not cache_question:
+        # 跳过缓存: 直接执行 RAG/Agent 流程
+        logger.info(
+            f"[非流式] 跳过问答缓存 | strategy={cache_strategy.value} | 问题:{question[:20]}..."
+        )
+        answer, retrieval_docs, cost_seconds, tokens_used = await perform_rag_and_llm_async(question)
+        record = build_interaction_record(
+            session_id=session_id, user_id=user_id, query=question,
+            retrieval_docs=retrieval_docs, generation=answer,
+            tokens_used=tokens_used, cost_seconds=cost_seconds,
+            source="non_stream_skip_cache",
+        )
+        asyncio.create_task(log_interaction_async(record))
+        asyncio.create_task(record_token_usage(
+            user_id=user_id, session_id=session_id,
+            text_tokens=tokens_used.get("total_tokens", 0),
+            voice_tokens=0, source="non_stream_skip_cache",
+        ))
+        return answer, retrieval_docs
+
     # 1: 查缓存（缓存命中直接返回，不加锁）
-    cached = await redis_manager.get_answer_async(question)
+    cached = await redis_manager.get_answer_async_with_prefix(cache_question, prefix=INDEPENDENT_CACHE_PREFIX)
     if cached:
         print("REDIS HIT !!!✅😊")
         cache_cost = round(time.time() - a3, 3)
@@ -625,13 +665,13 @@ async def get_or_compute_async(
         return cached, []   # 缓存命中: 返回答案 + 空文档列表
 
     # 2: 加锁防击穿
-    hash_key = hashlib.md5(question.encode("utf-8")).hexdigest()
+    hash_key = hashlib.md5(cache_question.encode("utf-8")).hexdigest()
     lock_token = await asyncio.to_thread(redis_manager.acquire_lock, hash_key)
 
     if lock_token:
         try:
             # 双重检查缓存
-            cached_ans_retry = await redis_manager.get_answer_async(question)
+            cached_ans_retry = await redis_manager.get_answer_async_with_prefix(cache_question, prefix=INDEPENDENT_CACHE_PREFIX)
             if cached_ans_retry:
                 print("REDIS HIT (Double Check) !!!✅😊")
                 record = build_interaction_record(
@@ -662,13 +702,13 @@ async def get_or_compute_async(
 
             a4 = time.time()
             if answer:
-                # 写缓存
-                await asyncio.to_thread(redis_manager.set_answer, question, answer)
+                # 写缓存 (使用规范化 question 作为稳定 Key)
+                await asyncio.to_thread(redis_manager.set_answer_with_prefix, cache_question, answer, INDEPENDENT_CACHE_PREFIX)
             else:
                 # 防缓存穿透: 写入空占位符
                 await asyncio.to_thread(
                     redis_manager.client.setex,
-                    redis_manager._generate_key(question), 60, "<EMPTY>",
+                    redis_manager._generate_key(cache_question, prefix=INDEPENDENT_CACHE_PREFIX), 60, "<EMPTY>",
                 )
             b4 = time.time()
             print("Redis write cost time: ", b4 - a4)
@@ -699,7 +739,7 @@ async def get_or_compute_async(
     else:
         # 获取锁失败, 等待重试
         await asyncio.sleep(0.01)
-        cached_fallback = await redis_manager.get_answer_async(question)
+        cached_fallback = await redis_manager.get_answer_async_with_prefix(cache_question, prefix=INDEPENDENT_CACHE_PREFIX)
         return (cached_fallback or "System busy, calculating..."), []
 
 

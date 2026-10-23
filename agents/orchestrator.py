@@ -15,6 +15,7 @@ agents/orchestrator.py — Multi-Agent 编排器
 """
 import asyncio
 import logging
+import os
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -81,6 +82,7 @@ class AgentOrchestrator:
         non_stream_model: str = "deepseek-chat",
         reasoner_model: str = "",
         neo4j_manager: Any = None,
+        stream_mode: str = "",
     ):
         # LLM 客户端 (DeepSeek, OpenAI 兼容的异步客户端)
         self.llm_client = llm_client
@@ -118,6 +120,14 @@ class AgentOrchestrator:
         self.stream_model = stream_model
         self.non_stream_model = non_stream_model
         self.reasoner_model = reasoner_model
+        # 流式反思模式:
+        #   - fast:   边生成边输出 (TTFT 最优), 结束后后台异步反思 (不修正已发送内容)
+        #   - strict: 医学问答先服务端完整生成 → 评估 → 必要时修正 → 复评, 再输出最终答案
+        # 可通过环境变量 REFLECTION_STREAM_MODE=fast|strict 配置, 默认 fast
+        self.stream_mode = (stream_mode or os.getenv("REFLECTION_STREAM_MODE", "fast")).strip().lower()
+        if self.stream_mode not in ("fast", "strict"):
+            logger.warning(f"[Orchestrator] 未知 stream_mode={self.stream_mode}, 回退为 fast")
+            self.stream_mode = "fast"
 
     # 异步非流式 Multi-Agent 主执行函数
     async def execute(
@@ -263,19 +273,20 @@ class AgentOrchestrator:
             retrieval_docs, is_medical=route.is_medical, query=query
         )
 
-        # ---- Phase 5: 异步反思 (fire-and-forget, 不阻塞返回) ----
-        # asyncio.create_task 创建独立协程, 主流程立刻返回 OrchestratorResult
-        # 反思在后台异步完成, 结果存入长期记忆 (Redis)
-        # 三个条件同时满足才触发: 有回答 + 反思功能启用 + 是医学问题
+        # ---- Phase 5: 反思 + 修正 (同步, 仅医学问答) ----
+        # 非流式路径在主流程内完成 评估 → (必要时) 修正 → 复评, 并保存最终结果;
+        # 不再通过 asyncio.create_task 对同一答案重复启动后台评估.
+        reflection_score = -1.0
         if self.enable_reflection and answer and route.is_medical:
-            asyncio.create_task(
-                self._async_reflect(
-                    query=query,
-                    answer=answer,
-                    context=context,
-                    user_id=user_id,
-                    session_id=session_id,
-                )
+            final_answer, reflection_score, reflection_record = await self._evaluate_and_correct(
+                query=query, answer=answer, context=context
+            )
+            answer = final_answer
+            await self._persist_reflection(
+                user_id=user_id, query=query,
+                score=reflection_score,
+                feedback=reflection_record.get("initial_feedback", ""),
+                extra=reflection_record,
             )
 
         # 记录到短期记忆 — 用于多轮对话上下文
@@ -297,6 +308,7 @@ class AgentOrchestrator:
             image_urls=image_urls,
             top_image_url=top_image_url,
             top_pdf_url=top_pdf_url,
+            reflection_score=reflection_score,
         )
 
     # 
@@ -338,14 +350,25 @@ class AgentOrchestrator:
             yield IDENTITY_RESPONSE
             return
 
-        # Phase 3: 执行技能 + 流式生成
-        # full_response 用于累积完整的回答文本 (反思和记忆需要完整文本)
+        # ---- 流式反思模式 ----
+        # fast:   边生成边 yield (TTFT 最优), 结束后后台异步反思 (不修正已发送内容)
+        # strict: 医学问答先服务端完整生成 → 评估 → 必要时修正 → 复评, 再一次性输出最终答案
+        strict = (
+            self.stream_mode == "strict"
+            and self.enable_reflection
+            and route.is_medical
+        )
+
+        # Phase 3: 执行技能 + 生成
+        # full_response 用于累积最终输出 (含 URL 后缀), 供记忆/日志使用;
+        # answer_body 只累积 LLM 正文 (不含 URL), 供 strict 模式反思使用.
         full_response = ""
+        answer_body = ""
+        url_suffix = ""
+        context = ""
         disclaimer_prefix = NON_MEDICAL_DISCLAIMER if route.intent == "general" else ""
 
         # ---- 读取多轮对话历史 (仅会话型请求, 不增加 TTFT) ----
-        # 无 session_id 时 history 恒为空串, 下游 Prompt 与升级前逐字节一致;
-        # 同时合并长期记忆中的用户关注话题 (仅已登录用户有), 实现跨会话个性化.
         history = await self._build_history_with_memory(session_id, user_id)
 
         if route.route == "chitchat":
@@ -353,7 +376,7 @@ class AgentOrchestrator:
             # 不调用搜索 API, 不检索 Milvus, LLM 用自身知识直接回答
             if disclaimer_prefix:
                 yield disclaimer_prefix
-                full_response += disclaimer_prefix
+                answer_body += disclaimer_prefix
             stream_gen = await self.medical_agent.generate(
                 query=query,
                 context="",
@@ -368,7 +391,7 @@ class AgentOrchestrator:
                     ttft = round(time.time() - t0, 3)
                     logger.info(f"[Orchestrator:Stream] TTFT={ttft}s (chitchat)")
                     first_token = True
-                full_response += delta
+                answer_body += delta
                 yield delta
 
         elif route.use_web_search or route.route == "web_search":
@@ -399,15 +422,15 @@ class AgentOrchestrator:
                     # 原因: 单独 yield 会在前端造成闪烁/断流感, 合并后用户看到的是一段连贯文本
                     if disclaimer_prefix:
                         delta = disclaimer_prefix + delta
-                full_response += delta
-                yield delta
+                answer_body += delta
+                if not strict:
+                    yield delta
             # 流式生成完毕后追加搜索来源 URL
-            # URL 不是 LLM 生成的一部分, 而是附加信息, 因此在流结束后单独 yield
             for web_url in web_urls:
                 if web_url:
-                    url_text = f"\n\n{web_url}"
-                    full_response += url_text
-                    yield url_text
+                    url_suffix += f"\n\n{web_url}"
+                    if not strict:
+                        yield f"\n\n{web_url}"
 
         else:
             # ---- Milvus RAG (+ 可选 Neo4j 图检索) + 流式生成路径 ----
@@ -454,31 +477,57 @@ class AgentOrchestrator:
                     ttft = round(time.time() - t0, 3)
                     logger.info(f"[Orchestrator:Stream] TTFT={ttft}s (RAG)")
                     first_token = True
-                full_response += delta
-                yield delta
+                answer_body += delta
+                if not strict:
+                    yield delta
             # 流式结束后追加图片和/或 PDF URL (最多各一个, 可同时存在)
-            # 这些 URL 不参与 LLM 生成, 是基于检索文档元数据提取的附加信息
             if top_image_url:
-                url_text = f"\n\n{top_image_url}"
-                full_response += url_text
-                yield url_text
+                url_suffix += f"\n\n{top_image_url}"
+                if not strict:
+                    yield f"\n\n{top_image_url}"
             if top_pdf_url:
-                url_text = f"\n\n{top_pdf_url}"
-                full_response += url_text
-                yield url_text
+                url_suffix += f"\n\n{top_pdf_url}"
+                if not strict:
+                    yield f"\n\n{top_pdf_url}"
 
-        # ---- Phase 4: 后台异步任务 (流式输出完毕后执行, 不阻塞客户端) ----
+        full_response = answer_body + url_suffix
+
+        # ---- strict 模式: 服务端评估/修正后再输出 (不暴露反思过程) ----
+        if strict:
+            final_answer, reflection_score, record = await self._evaluate_and_correct(
+                query=query, answer=answer_body, context=context
+            )
+            await self._persist_reflection(
+                user_id=user_id, query=query,
+                score=reflection_score,
+                feedback=record.get("initial_feedback", ""),
+                extra=record,
+            )
+            if session_id:
+                self.memory.add_turn(session_id, "user", query)
+                self.memory.add_turn(session_id, "assistant", final_answer[:200])
+            # 保留 URL 后缀 (来源链接), 仅输出最终答案, 不向客户端暴露评估/修正过程
+            final_output = final_answer + url_suffix
+            chunk_size = 20
+            for i in range(0, len(final_output), chunk_size):
+                yield final_output[i:i + chunk_size]
+                await asyncio.sleep(0)
+            t_end = time.time()
+            logger.info(
+                f"[Orchestrator:Stream] 完毕(strict) | 总耗时={round(t_end - t0, 3)}s | "
+                f"输出={len(final_output)}字符 | reflection_score={reflection_score}"
+            )
+            return
+
+        # ---- Phase 4: 后台异步任务 (fast 模式, 流式输出完毕后执行) ----
         # asyncio.create_task 是 fire-and-forget 模式: 创建协程但不 await 它
-        # 即使反思失败也不影响已经输出完毕的流式回答
-        # 仅对医学问题执行反思 (非医学问题价值不大)
+        # 仅做评估与记录, 不尝试修改已经发送给客户端的回答
         if full_response and self.enable_reflection and route.is_medical:
             asyncio.create_task(
                 self._async_reflect(
                     query=query,
                     answer=full_response,
-                    # 安全检查: context 在 if/else 两个分支中都有定义,
-                    # 但使用 'context' in dir() 作为双重保险, 防止意外的变量未定义
-                    context=context if 'context' in dir() else "",
+                    context=context,
                     user_id=user_id,
                     session_id=session_id,
                 )
@@ -562,6 +611,94 @@ class AgentOrchestrator:
             return history
         return f"{user_memory}\n{history}" if history else user_memory
 
+    async def _evaluate_and_correct(
+        self, query: str, answer: str, context: str
+    ) -> Tuple[str, float, Dict]:
+        """
+        评估 → (必要时) 修正 → 复评, 最多自动修正一次, 禁止无限循环.
+
+        :return: (最终回答, 最终反思评分, 记录字典)
+          最终反思评分 = -1.0 表示评估无效 (未产生可靠评分).
+        """
+        record: Dict[str, Any] = {
+            "evaluation_ok": False,
+            "initial_score": -1.0,
+            "accuracy": 0.0,
+            "completeness": 0.0,
+            "safety": 0.0,
+            "relevance": 0.0,
+            "initial_feedback": "",
+            "corrected": False,
+            "correction_ok": None,
+            "final_score": -1.0,
+            "failure_reason": "",
+        }
+
+        initial = await self.reflection_agent.evaluate(query, answer, context[:500])
+        record["evaluation_ok"] = initial.evaluation_ok
+        record["accuracy"] = initial.accuracy
+        record["completeness"] = initial.completeness
+        record["safety"] = initial.safety
+        record["relevance"] = initial.relevance
+        record["initial_feedback"] = initial.feedback
+
+        # 评估失败: 不伪造高分, 不触发修正, 保守保留原始回答
+        if not initial.evaluation_ok:
+            record["failure_reason"] = "评估失败: " + (initial.feedback or "未知原因")
+            return answer, -1.0, record
+
+        record["initial_score"] = initial.score
+        # 无需修正: 直接保留原答案
+        if not initial.needs_correction:
+            record["final_score"] = initial.score
+            return answer, initial.score, record
+
+        # 触发修正 (仅一次)
+        record["corrected"] = True
+        corrected, ok = await self.reflection_agent.correct(
+            query=query, original_answer=answer, reflection=initial, context=context
+        )
+        record["correction_ok"] = ok
+        if not ok:
+            # 修正失败: 保守回退原始回答, 不伪装成功
+            record["failure_reason"] = "修正失败, 保留原始回答"
+            record["final_score"] = initial.score
+            return answer, initial.score, record
+
+        # 复评修正后的回答
+        final = await self.reflection_agent.evaluate(query, corrected, context[:500])
+        if not final.evaluation_ok:
+            # 复评失败: 保守保留原始回答 (修正结果未经验证, 不贸然采用)
+            record["failure_reason"] = "复评失败, 保守保留原始回答: " + (final.feedback or "")
+            record["final_score"] = initial.score
+            return answer, initial.score, record
+
+        record["final_score"] = final.score
+        if final.score >= self.reflection_agent.threshold:
+            # 修正后达标: 采用修正回答
+            return corrected, final.score, record
+
+        # 修正后仍低分: 不再重试, 诚实记录低分与失败原因
+        if final.score >= initial.score:
+            record["failure_reason"] = "复评后评分仍低于阈值, 未通过质量验证"
+            return corrected, final.score, record
+        record["failure_reason"] = "修正后评分下降, 保守保留原始回答"
+        return answer, initial.score, record
+
+    async def _persist_reflection(
+        self, user_id: str, query: str, score: float, feedback: str, extra: Dict
+    ):
+        """将反思结果写入长期记忆 (仅已登录用户; 匿名用户跨会话不可追踪, 跳过)."""
+        if user_id == "anonymous":
+            return
+        await self.memory.save_reflection(
+            user_id=user_id,
+            query=query,
+            score=score,
+            feedback=feedback,
+            extra=extra,
+        )
+
     async def _async_reflect(
         self,
         query: str,
@@ -571,29 +708,28 @@ class AgentOrchestrator:
         session_id: str,
     ):
         """
-        异步反思 — fire-and-forget, 不阻塞主流程
-        结果保存到长期记忆, 供后续请求参考
+        异步反思 (仅 fast 流式模式) — fire-and-forget, 不阻塞主流程.
+        只评估并记录, 不尝试修正已经发送给客户端的回答.
         """
         try:
-            # 调用 ReflectionAgent.evaluate() 进行四维度质量评估
-            # context[:500] 截断: 反思只需要检索摘要作为参照, 不需要完整上下文, 节省 token
             result = await self.reflection_agent.evaluate(
                 query=query, answer=answer, context=context[:500]
             )
-            # 仅对已登录用户保存反思结果到长期记忆 (Redis Hash, 7天 TTL)
-            # 匿名用户无法跨会话追踪, 保存无意义
-            # 保存的反思历史可用于: 1) 了解用户常见问题模式 2) Agent 自我改进参考
-            if user_id != "anonymous":
-                await self.memory.save_reflection(
-                    user_id=user_id,
-                    query=query,
-                    score=result.score,
-                    feedback=result.feedback,
-                )
-            # 记录需要修正的回答 — 但流式场景下仅记录日志, 不实际修正
-            # 原因: 流式回答已经推送给客户端, 无法撤回或替换
-            # 修正结果会存入记忆, 当用户下次问同一类问题时可以参考
- 
+            extra = {
+                "evaluation_ok": result.evaluation_ok,
+                "initial_score": result.score,
+                "corrected": False,
+                "correction_ok": None,
+                "final_score": result.score,
+                "failure_reason": "" if result.evaluation_ok else result.feedback,
+            }
+            await self._persist_reflection(
+                user_id=user_id,
+                query=query,
+                score=result.score if result.evaluation_ok else -1.0,
+                feedback=result.feedback,
+                extra=extra,
+            )
         except Exception as e:
             # 反思失败不影响主流程 — 本方法运行在 fire-and-forget 的独立 task 中
             logger.warning(f"[Orchestrator] 异步反思失败: {e}")

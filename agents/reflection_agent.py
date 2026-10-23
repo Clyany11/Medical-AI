@@ -33,6 +33,7 @@ class ReflectionResult:
     feedback: str = ""              # 反思反馈
     needs_correction: bool = False  # 当 score < threshold 时为 True, 触发下游修正流程
     duration_ms: float = 0.0
+    evaluation_ok: bool = True      # 评估是否成功 (解析失败/异常时为 False, 此时 score=-1.0 无效)
 
 
 class ReflectionAgent:
@@ -98,31 +99,51 @@ class ReflectionAgent:
             )
             # 提取 LLM 返回的文本内容 (Chat Completions: choices[0].message.content)
             result_text = response.choices[0].message.content or ""
-            # 解析 JSON
             parsed = self._parse_evaluation(result_text)
             duration = round((time.time() - t0) * 1000, 2)
+            if parsed is None:
+                # 解析失败: 不伪造高分, 标记评估无效, 由编排器按保守策略处理
+                logger.warning("[ReflectionAgent] 评估 JSON 解析失败")
+                return self._invalid_result("评估结果 JSON 解析失败", duration)
+
+            # 校验四个维度分数是否存在且为 0~1 之间的合法数值
+            for field_name in ("accuracy", "completeness", "safety", "relevance"):
+                if not self._is_valid_score(parsed.get(field_name)):
+                    logger.warning(
+                        f"[ReflectionAgent] 评估字段 {field_name} 缺失或非法: "
+                        f"{parsed.get(field_name)!r}"
+                    )
+                    return self._invalid_result(
+                        f"评估字段 {field_name} 缺失或非法", duration
+                    )
+
             # 计算加权总分 (非简单平均)
             # 权重设计理由:
             #   accuracy (准确性)*0.35:     医学场景中准确性最为关键, 错误信息可能危及生命
             #   safety (安全性)*0.25:       安全性次之, 回答不能包含有害建议或误导性用药指导
             #   completeness (完整性)*0.25: 确保回答全面, 不遗漏重要注意事项或禁忌
             #   relevance (相关性)*0.15:    权重最低, 因为即使稍有偏题, 只要准确安全仍可接受
+            accuracy = float(parsed["accuracy"])
+            completeness = float(parsed["completeness"])
+            safety = float(parsed["safety"])
+            relevance = float(parsed["relevance"])
             score = (
-                parsed.get("accuracy", 0.8) * 0.35 +
-                parsed.get("completeness", 0.7) * 0.25 +
-                parsed.get("safety", 0.9) * 0.25 +
-                parsed.get("relevance", 0.8) * 0.15
+                accuracy * 0.35 +
+                completeness * 0.25 +
+                safety * 0.25 +
+                relevance * 0.15
             )
             # 构建评估结果, needs_correction 由加权总分与阈值比较决定
             result = ReflectionResult(
                 score=round(score, 3),
-                accuracy=parsed.get("accuracy", 0.8),
-                completeness=parsed.get("completeness", 0.7),
-                safety=parsed.get("safety", 0.9),
-                relevance=parsed.get("relevance", 0.8),
-                feedback=parsed.get("feedback", ""),
+                accuracy=accuracy,
+                completeness=completeness,
+                safety=safety,
+                relevance=relevance,
+                feedback=str(parsed.get("feedback", "") or ""),
                 needs_correction=score < self.threshold,
                 duration_ms=duration,
+                evaluation_ok=True,
             )
             logger.info(
                 f"[ReflectionAgent] 评估完成 | score={result.score:.3f} | "
@@ -130,18 +151,10 @@ class ReflectionAgent:
             )
             return result
         except Exception as e:
-            # 评估失败时的容错策略: 给予 "疑罪从无" 的默认高分 (0.8)
-            # needs_correction=False 确保评估失败不会误触发修正流程
-            # 理由: 评估本身是辅助增强, 失败时不应影响主流程正常出答
+            # 评估失败: 不伪造高分, 标记评估无效, 由编排器按保守策略处理
             logger.warning(f"[ReflectionAgent] 评估失败: {e}")
             duration = round((time.time() - t0) * 1000, 2)
-            return ReflectionResult(
-                score=0.8, accuracy=0.8, completeness=0.8,
-                safety=0.9, relevance=0.8,
-                feedback="评估失败, 使用默认分数",
-                needs_correction=False,
-                duration_ms=duration,
-            )
+            return self._invalid_result(f"评估异常: {e}", duration)
 
     # 
     async def correct(
@@ -150,73 +163,91 @@ class ReflectionAgent:
         original_answer: str,
         reflection: ReflectionResult,
         context: str = "",
-    ) -> str:
+    ) -> Tuple[str, bool]:
         """
-        基于反思结果修正回答
-        :param query: 原始问题
-        :param original_answer: 原始回答
-        :param reflection: 反思结果
-        :param context: 检索上下文
-        :return: 修正后的回答
+        基于反思结果修正回答.
+        :return: (修正后的回答, 是否成功)
+          - 成功: 返回非空的修正文本, 第二项为 True
+          - 失败 (LLM 异常或返回空): 回退原始回答, 第二项为 False (不伪装成功)
         """
         t0 = time.time()
-        # 构造修正 Prompt
-        # original_answer 截取前 600 字符: 比 evaluate 中的 800 更短,
-        # 因为修正时只需要让 LLM 了解原始回答的大致方向和问题所在,
-        # 无需完整内容, 省 token 的同时保留足够上下文供修正参考
+        # 构造修正 Prompt — 结合原始问题/回答/反馈/证据, 并施加医学安全约束
         correct_prompt = (
-            "你是一个医学专家, 之前的回答质量不够好, 请改进。\n\n"
+            "你是一个医学专家。之前的回答经质量评估后不达标，请基于以下材料改进回答。\n\n"
             f"问题: {query}\n\n"
             f"原始回答: {original_answer[:600]}\n\n"
             f"质量评估反馈: {reflection.feedback}\n"
-            f"评分: 准确性={reflection.accuracy:.1f}, "
-            f"完整性={reflection.completeness:.1f}, "
-            f"安全性={reflection.safety:.1f}\n\n"
+            f"各维度评分: 准确性={reflection.accuracy:.2f}, "
+            f"完整性={reflection.completeness:.2f}, "
+            f"安全性={reflection.safety:.2f}, "
+            f"相关性={reflection.relevance:.2f}\n\n"
+            "修正要求:\n"
+            "1. 结合原始问题、原始回答、评估反馈和参考资料修正回答;\n"
+            "2. 不得编造参考资料中没有支持的医学事实;\n"
+            "3. 不得为了让回答更完整而擅自增加药物剂量、疗程或个体化治疗建议;\n"
+            "4. 当参考资料不足时, 明确说明无法从现有证据可靠确认;\n"
+            "5. 保留必要的医学安全提示与来源引用, 不得无依据地删除原回答中的有效引用;\n"
+            "6. 只输出修正后的回答正文, 不要输出任何解释或思考过程。\n\n"
         )
         if context:
             correct_prompt += f"参考资料: {context[:800]}\n\n"
-        correct_prompt += "请生成一个更准确, 更完整, 更安全的回答:"
+        correct_prompt += "请输出修正后的回答:"
         try:
             response = await self.llm_client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": correct_prompt}],
                 stream=False,
             )
-            corrected = response.choices[0].message.content or ""
+            corrected = (response.choices[0].message.content or "").strip()
             duration = round((time.time() - t0) * 1000, 2)
+            if not corrected:
+                # 修正失败: 返回空则回退原始回答, 不返回空答案, 不伪装成功
+                logger.warning(
+                    f"[ReflectionAgent] 修正返回空答案 | 耗时={duration}ms | 回退原始回答"
+                )
+                return original_answer, False
             logger.info(
                 f"[ReflectionAgent] 修正完成 | 耗时={duration}ms | "
                 f"原长度={len(original_answer)} → 新长度={len(corrected)}"
             )
-            # 返回修正后的回答, 如果 LLM 返回空内容则回退到原始回答
-            # 核心原则: 永远不返回空字符串, 修正失败不应该让用户看不到任何回答
-            return corrected if corrected else original_answer
+            return corrected, True
         except Exception as e:
-            # 优雅降级: 修正失败时返回原始回答, 而非抛出异常
-            # 修正是锦上添花的增强环节, 失败不应丢失已经生成的原始回答
+            # 修正失败: 回退原始回答, 不抛出异常, 不伪装成功
             logger.warning(f"[ReflectionAgent] 修正失败: {e}")
-            return original_answer
+            return original_answer, False
 
-    def _parse_evaluation(self, text: str) -> Dict[str, Any]:
-        """解析 LLM 返回的评估 JSON"""
+    def _parse_evaluation(self, text: str) -> Optional[Dict[str, Any]]:
+        """解析 LLM 返回的评估 JSON; 失败时返回 None (不伪造默认高分)."""
         try:
             # JSON 提取策略: 从第一个 '{' 到最后一个 '}' 截取
-            # LLM 可能在 JSON 前后添加解释性文字 (如 "以下是评估结果:"),
-            # 通过 find/rfind 定位 JSON 边界, 跳过这些多余文本
             start = text.find('{')
             end = text.rfind('}') + 1
             if start >= 0 and end > start:
                 return json.loads(text[start:end])
         except (json.JSONDecodeError, ValueError):
             pass
-        # 解析失败时返回乐观的默认值 (偏高分)
-        # 刻意设置偏高的默认值 (0.8/0.7/0.9/0.8) 以避免误触发修正:
-        # 如果无法解析评估结果, 宁可放过一个低质量回答, 也不要因解析错误
-        # 而无谓地触发修正流程 (修正本身也有延迟和出错风险)
-        return {
-            "accuracy": 0.8,
-            "completeness": 0.7,
-            "safety": 0.9,
-            "relevance": 0.8,
-            "feedback": "JSON解析失败",
-        }
+        return None
+
+    @staticmethod
+    def _is_valid_score(value: Any) -> bool:
+        """校验评分是否为 0~1 之间的合法数值 (排除 bool/None/字符串)."""
+        if isinstance(value, bool) or value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return 0.0 <= float(value) <= 1.0
+        return False
+
+    @staticmethod
+    def _invalid_result(reason: str, duration_ms: float) -> ReflectionResult:
+        """构造评估无效结果: score=-1.0 表示无效, 不触发修正, 不伪装高分."""
+        return ReflectionResult(
+            score=-1.0,
+            accuracy=0.0,
+            completeness=0.0,
+            safety=0.0,
+            relevance=0.0,
+            feedback=reason,
+            needs_correction=False,
+            duration_ms=duration_ms,
+            evaluation_ok=False,
+        )

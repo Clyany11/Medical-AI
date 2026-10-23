@@ -256,20 +256,31 @@ class LongTermMemory:
         except Exception as e:
             logger.warning(f"[LongTermMemory] 加载失败: {e}")
         return None
-    async def save_reflection(self, user_id: str, query: str, score: float, feedback: str):
-        """保存反思结果 (用于 Agent 学习)"""
+    async def save_reflection(
+        self, user_id: str, query: str, score: float, feedback: str,
+        extra: Optional[Dict] = None,
+    ):
+        """保存反思结果 (用于 Agent 学习)
+
+        extra 用于扩展记录字段 (如 initial_score / corrected / correction_ok /
+        failure_reason / evaluation_ok 等), 与旧结构兼容: 旧字段
+        query/score/feedback/timestamp 保持不变, 旧记录仍可正常读取.
+        """
         # 从 Redis 加载现有的反思历史列表, 若不存在则初始化空列表
         history = await self.load(user_id, "reflection_history") or []
         # 追加本次反思记录:
         # - query[:100]: 截断到 100 字符, 节省 Redis 内存 (只需记住问题大意)
         # - feedback[:200]: 截断到 200 字符, 保留关键的改进建议
         # - timestamp: 记录时间, 用于后续按时间排序或过期淘汰
-        history.append({
+        record = {
             "query": query[:100],
             "score": score,
             "feedback": feedback[:200],
             "timestamp": time.time(),
-        })
+        }
+        if extra:
+            record.update(extra)
+        history.append(record)
         # 只保留最近 50 条 — 固定大小队列, 防止列表无限增长
         # 50 条足以覆盖一周左右的使用频率, 同时控制 Redis 单 key 大小
         history = history[-50:]
@@ -325,9 +336,12 @@ class MemoryManager:
     async def load_long_term(self, user_id: str, key: str) -> Optional[Any]:
         """从长期记忆加载"""
         return await self.long_term.load(user_id, key)
-    async def save_reflection(self, user_id: str, query: str, score: float, feedback: str):
+    async def save_reflection(
+        self, user_id: str, query: str, score: float, feedback: str,
+        extra: Optional[Dict] = None,
+    ):
         """保存反思结果"""
-        await self.long_term.save_reflection(user_id, query, score, feedback)
+        await self.long_term.save_reflection(user_id, query, score, feedback, extra=extra)
     def clear_session(self, session_id: str):
         """清除会话记忆"""
         self.short_term.clear(session_id)
